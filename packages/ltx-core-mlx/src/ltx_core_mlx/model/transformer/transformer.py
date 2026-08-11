@@ -46,6 +46,10 @@ class BasicAVTransformerBlock(nn.Module):
         av_cross_head_dim: Per-head dim for cross-modal attention (default 64).
         ff_mult: Feed-forward expansion factor.
         norm_eps: Epsilon for layer norms.
+        ff_bias: Whether the video FFN carries biases. LTX-2.3: True.
+            LTX-2.5: False (the checkpoint ships no ``ff.proj_*.bias``).
+        audio_ff_bias: Same, for the audio FFN. Separate flag because
+            upstream keeps them separate — a future checkpoint may differ.
     """
 
     def __init__(
@@ -60,6 +64,8 @@ class BasicAVTransformerBlock(nn.Module):
         av_cross_head_dim: int = 64,
         ff_mult: float = 4.0,
         norm_eps: float = 1e-6,
+        ff_bias: bool = True,
+        audio_ff_bias: bool = True,
     ):
         super().__init__()
 
@@ -133,10 +139,10 @@ class BasicAVTransformerBlock(nn.Module):
         )
 
         # ---- Video feed-forward ----
-        self.ff = FeedForward(video_dim, dim_out=video_dim, mult=ff_mult)
+        self.ff = FeedForward(video_dim, dim_out=video_dim, mult=ff_mult, bias=ff_bias)
 
         # ---- Audio feed-forward ----
-        self.audio_ff = FeedForward(audio_dim, dim_out=audio_dim, mult=ff_mult)
+        self.audio_ff = FeedForward(audio_dim, dim_out=audio_dim, mult=ff_mult, bias=audio_ff_bias)
 
         # ---- Scale-shift tables (raw parameters, added to timestep-computed params) ----
         # Video self-attn: 9 params (shift, scale, gate) x 3 (self-attn, text-xattn, ff)
@@ -175,6 +181,29 @@ class BasicAVTransformerBlock(nn.Module):
             p = p + table[None, None, :num_params, :]
             return [p[:, :, i, :] for i in range(num_params)]
 
+    @staticmethod
+    def _prompt_kv_modulation(
+        params: mx.array | None, table: mx.array, dim: int
+    ) -> tuple[mx.array, mx.array]:
+        """Return ``(shift_kv, scale_kv)`` for the text cross-attention K/V.
+
+        Mirrors upstream ``apply_cross_attention_adaln``: the static per-block
+        ``prompt_scale_shift_table`` is always applied, and the timestep-
+        conditioned AdaLN output is *added on top* only when the prompt-side
+        AdaLN MLP exists.
+
+        ``params is None`` is the LTX-2.5 ``use_prompt_adaln_single=False``
+        case: the K/V modulation loses its timestep dependence entirely, which
+        is the whole point — K/V become computable once per prompt and
+        cacheable across denoising steps. This is NOT a degenerate fallback;
+        it is the checkpoint's declared architecture.
+        """
+        if params is None:
+            kv = table[None, None, :2, :]
+            return kv[:, :, 0, :], kv[:, :, 1, :]
+        shift_kv, scale_kv = BasicAVTransformerBlock._unpack_adaln(params, table, 2, dim)
+        return shift_kv, scale_kv
+
     def _rms_norm(self, x: mx.array) -> mx.array:
         """Affine-free RMS norm (no mean subtraction, matches reference rms_norm)."""
         return mx.fast.rms_norm(x, weight=None, eps=self._norm_eps)
@@ -210,8 +239,8 @@ class BasicAVTransformerBlock(nn.Module):
         audio_hidden: mx.array,
         video_adaln_params: mx.array,
         audio_adaln_params: mx.array,
-        video_prompt_adaln_params: mx.array,
-        audio_prompt_adaln_params: mx.array,
+        video_prompt_adaln_params: mx.array | None,
+        audio_prompt_adaln_params: mx.array | None,
         av_ca_video_params: mx.array,
         av_ca_audio_params: mx.array,
         av_ca_a2v_gate_params: mx.array,
@@ -324,7 +353,9 @@ class BasicAVTransformerBlock(nn.Module):
         # --- 3. Video text cross-attention (AdaLN indices 6-8 + prompt table for KV) ---
         if video_text_embeds is not None:
             video_normed = self._rms_norm(video_hidden) * (1.0 + v_scale_ca) + v_shift_ca
-            vp_shift, vp_scale = self._unpack_adaln(video_prompt_adaln_params, self.prompt_scale_shift_table, 2, vdim)
+            vp_shift, vp_scale = self._prompt_kv_modulation(
+                video_prompt_adaln_params, self.prompt_scale_shift_table, vdim
+            )
             text_scaled = video_text_embeds * (1.0 + vp_scale) + vp_shift
             video_hidden = (
                 video_hidden
@@ -339,8 +370,8 @@ class BasicAVTransformerBlock(nn.Module):
         # --- 4. Audio text cross-attention ---
         if audio_text_embeds is not None:
             audio_normed = self._rms_norm(audio_hidden) * (1.0 + a_scale_ca) + a_shift_ca
-            ap_shift, ap_scale = self._unpack_adaln(
-                audio_prompt_adaln_params, self.audio_prompt_scale_shift_table, 2, adim
+            ap_shift, ap_scale = self._prompt_kv_modulation(
+                audio_prompt_adaln_params, self.audio_prompt_scale_shift_table, adim
             )
             text_scaled = audio_text_embeds * (1.0 + ap_scale) + ap_shift
             audio_hidden = audio_hidden + self.audio_attn2(audio_normed, encoder_hidden_states=text_scaled) * a_gate_ca

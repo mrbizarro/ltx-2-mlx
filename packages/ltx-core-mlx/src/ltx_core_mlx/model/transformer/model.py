@@ -46,6 +46,86 @@ class Modality(Enum):
     AUDIO = "audio"
 
 
+def parse_model_version(version: str) -> tuple[int, ...]:
+    """Turn a ``model_version`` string into a comparable tuple of ints.
+
+    Mirrors upstream ``ltx_pipelines.utils.constants.parse_model_version``.
+    Pre-release tags arrive both dot- and hyphen-separated (``"2.3.rc1"``,
+    ``"2.4-rc2"``), so the separator is normalised first and any non-numeric
+    component ends the parse — a release candidate therefore maps onto the
+    generation it is a candidate for.
+
+    Returns ``()`` for an unparseable or empty version. The empty tuple
+    compares below every real version, so an unversioned checkpoint always
+    falls through to the oldest behaviour rather than accidentally opting
+    into a newer one.
+    """
+    parts: list[int] = []
+    for chunk in (version or "").replace("-", ".").split("."):
+        if not chunk.isdigit():
+            break
+        parts.append(int(chunk))
+    return tuple(parts)
+
+
+def _parse_model_version(config: dict, default: tuple[int, int]) -> tuple[int, ...]:
+    """Pull ``model_version`` out of a checkpoint config blob.
+
+    The field lives at the TOP level of the metadata ``config`` JSON, next to
+    ``transformer``/``vae``, never inside the transformer sub-dict — so this
+    deliberately takes the whole blob, not the sub-dict the rest of
+    ``from_checkpoint_config`` reads.
+    """
+    raw = config.get("model_version")
+    if raw is None:
+        return default
+    parsed = parse_model_version(str(raw))
+    return parsed or default
+
+
+def read_checkpoint_metadata_config(path) -> dict:
+    """Read the ``__metadata__`` config blob out of a safetensors file.
+
+    LTX-2.5 ships its architecture in the checkpoint's safetensors header
+    (``__metadata__["config"]``, a JSON string, plus ``model_version``)
+    instead of a sibling ``config.json``. Reading it costs a header parse, not
+    a weight load — the header is the first few MB of the file, so this is
+    cheap enough to do before deciding what to build.
+
+    Returns ``{}`` when the file has no metadata, is unreadable, or holds
+    unparseable JSON. Callers fall back to ``config.json`` /
+    ``embedded_config.json`` and finally to the 2.3 defaults.
+    """
+    import json
+    from pathlib import Path
+
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        import mlx.core as _mx
+
+        header = _mx.load(str(path), return_metadata=True)[1] or {}
+    except Exception:  # noqa: BLE001 — any read failure means "no metadata"
+        try:
+            from safetensors import safe_open
+
+            with safe_open(str(path), framework="np") as f:
+                header = f.metadata() or {}
+        except Exception:  # noqa: BLE001
+            return {}
+    config = {}
+    raw_config = header.get("config")
+    if raw_config:
+        try:
+            config = json.loads(raw_config)
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+    if "model_version" in header and "model_version" not in config:
+        config["model_version"] = header["model_version"]
+    return config
+
+
 @dataclass
 class LTXModelConfig:
     """Configuration for LTXModel."""
@@ -70,6 +150,35 @@ class LTXModelConfig:
     positional_embedding_max_pos: tuple[int, ...] = (20, 2048, 2048)
     audio_positional_embedding_max_pos: tuple[int, ...] = (20,)
     norm_eps: float = 1e-6
+
+    # ---- Generation-varying architecture flags (LTX-2.5) -------------------
+    # Every one of these defaults to its LTX-2.3 value, so an unversioned or
+    # pre-2.5 checkpoint builds exactly the model it built before this change.
+    # A 2.5 checkpoint's config flips them. They are architecture, not tuning:
+    # get one wrong and the model still loads, still runs, and produces
+    # garbage — which is precisely the class of bug that cost weeks in June.
+    ff_bias: bool = True
+    """FFN biases in the video feed-forward. LTX-2.5 sets ``false``."""
+    audio_ff_bias: bool = True
+    """FFN biases in the audio feed-forward. LTX-2.5 sets ``false``."""
+    connector_ff_bias: bool = True
+    """FFN biases inside the embeddings connector blocks."""
+    use_prompt_adaln_single: bool = True
+    """Whether the prompt-side AdaLN MLP exists. LTX-2.5's KV-cacheable
+    checkpoints set ``false``: text cross-attention K/V lose their timestep
+    dependence and are computable once per prompt."""
+    use_keyframes_abs_pos_embedding: bool = False
+    """Whether the DiT carries the learned ``keyframes_abs_pos_embedding``
+    marker added to single-pixel-frame tokens. Only generated-keyframe
+    checkpoints ship it."""
+
+    model_version: tuple[int, int] = (2, 3)
+    """Checkpoint generation, e.g. ``(2, 3)`` or ``(2, 5)``. Read from the
+    safetensors ``__metadata__`` when present. Gates behaviour that is a
+    *pipeline* choice rather than an architecture flag — chiefly the
+    ancestral sampler (upstream: ``ANCESTRAL_SAMPLER_SINCE_VERSION = (2, 5)``).
+    Defaults to 2.3 because that is what an unlabelled checkpoint on this
+    machine is."""
 
     @classmethod
     def from_checkpoint_config(cls, config: dict) -> LTXModelConfig:
@@ -117,7 +226,34 @@ class LTXModelConfig:
                 t.get("audio_positional_embedding_max_pos", d.audio_positional_embedding_max_pos)
             ),
             norm_eps=t.get("norm_eps", d.norm_eps),
+            # LTX-2.5 architecture flags. Mirrors upstream
+            # LTXAudioVideoModelConfigurator.from_metadata: every key defaults
+            # to the 2.3 value, so a checkpoint that predates them is
+            # unaffected. See ltx_core/model/transformer/model_configurator.py.
+            ff_bias=t.get("ff_bias", d.ff_bias),
+            audio_ff_bias=t.get("audio_ff_bias", d.audio_ff_bias),
+            connector_ff_bias=t.get("connector_ff_bias", d.connector_ff_bias),
+            use_prompt_adaln_single=t.get("use_prompt_adaln_single", d.use_prompt_adaln_single),
+            use_keyframes_abs_pos_embedding=t.get(
+                "use_keyframes_abs_pos_embedding", d.use_keyframes_abs_pos_embedding
+            ),
+            model_version=_parse_model_version(config, default=d.model_version),
         )
+
+    @classmethod
+    def from_checkpoint_file(cls, checkpoint_path) -> LTXModelConfig | None:
+        """Build a config from a safetensors checkpoint's own header.
+
+        This is the LTX-2.5 path: the architecture travels *with* the weights
+        in ``__metadata__["config"]`` rather than in a sibling JSON. Returns
+        ``None`` when the file carries no usable config, so the caller can
+        fall through to :meth:`from_checkpoint_dir` for 2.3-style layouts
+        instead of silently getting defaults.
+        """
+        config = read_checkpoint_metadata_config(checkpoint_path)
+        if not config:
+            return None
+        return cls.from_checkpoint_config(config)
 
     @classmethod
     def from_checkpoint_dir(cls, model_dir) -> LTXModelConfig:
@@ -193,8 +329,13 @@ class LTXModel(nn.Module):
         self.audio_adaln_single = AdaLayerNormSingle(ad, num_params=9, timestep_dim=t_dim)
 
         # --- Prompt (text cross-attn) AdaLN (2-param: shift, scale) ---
-        self.prompt_adaln_single = AdaLayerNormSingle(vd, num_params=2, timestep_dim=t_dim)
-        self.audio_prompt_adaln_single = AdaLayerNormSingle(ad, num_params=2, timestep_dim=t_dim)
+        # Absent on checkpoints that declare use_prompt_adaln_single=false
+        # (LTX-2.5's KV-cacheable line). Building it anyway would add two
+        # randomly-initialised MLPs whose output is *added* to the per-block
+        # prompt table — the model would load clean and denoise into noise.
+        if config.use_prompt_adaln_single:
+            self.prompt_adaln_single = AdaLayerNormSingle(vd, num_params=2, timestep_dim=t_dim)
+            self.audio_prompt_adaln_single = AdaLayerNormSingle(ad, num_params=2, timestep_dim=t_dim)
 
         # --- AV cross-attention AdaLN ---
         self.av_ca_video_scale_shift_adaln_single = AdaLayerNormSingle(vd, num_params=4, timestep_dim=t_dim)
@@ -215,9 +356,19 @@ class LTXModel(nn.Module):
                 av_cross_head_dim=config.av_cross_head_dim,
                 ff_mult=config.ff_mult,
                 norm_eps=config.norm_eps,
+                ff_bias=config.ff_bias,
+                audio_ff_bias=config.audio_ff_bias,
             )
             for _ in range(config.num_layers)
         ]
+
+        # --- Keyframe absolute position marker (generated-keyframe ckpts) ---
+        # A single learned (1, video_dim) vector added to the tokens of every
+        # standalone pixel frame. Only present when the checkpoint ships it;
+        # upstream detects it by key presence, we take it from config so the
+        # two agree.
+        if config.use_keyframes_abs_pos_embedding:
+            self.keyframes_abs_pos_embedding = mx.zeros((1, vd))
 
         # Training-only: recompute each block in the backward pass instead of
         # storing all 48 blocks' activations. Caps activation memory at ~1 block
@@ -415,8 +566,12 @@ class LTXModel(nn.Module):
         # AV cross-attention gate always uses scalar timestep at av_ca scale,
         # even in per-token mode. Reference: gate_adaln receives sigma * av_ca_factor (scalar).
         av_ca_a2v_gate_emb, _ = self.av_ca_a2v_gate_adaln_single(t_emb_av_gate)
-        # Prompt AdaLN: always scalar (from global timestep)
-        video_prompt_emb, _ = self.prompt_adaln_single(t_emb)
+        # Prompt AdaLN: always scalar (from global timestep). None on 2.5's
+        # KV-cacheable checkpoints — the block then uses its static prompt
+        # table alone, which is what makes the K/V reusable across steps.
+        video_prompt_emb = None
+        if self.config.use_prompt_adaln_single:
+            video_prompt_emb, _ = self.prompt_adaln_single(t_emb)
 
         # Audio AdaLN: per-token or scalar
         if audio_timesteps is not None:
@@ -428,8 +583,10 @@ class LTXModel(nn.Module):
             av_ca_audio_emb, _ = self.av_ca_audio_scale_shift_adaln_single(t_emb)
         # AV cross-attention gate always uses scalar timestep at av_ca scale
         av_ca_v2a_gate_emb, _ = self.av_ca_v2a_gate_adaln_single(t_emb_av_gate)
-        # Audio prompt AdaLN: always scalar (from global timestep)
-        audio_prompt_emb, _ = self.audio_prompt_adaln_single(t_emb)
+        # Audio prompt AdaLN: always scalar (from global timestep); see above.
+        audio_prompt_emb = None
+        if self.config.use_prompt_adaln_single:
+            audio_prompt_emb, _ = self.audio_prompt_adaln_single(t_emb)
 
         # RoPE frequencies (per-head, using reference log-spaced grid)
         video_rope_freqs = None

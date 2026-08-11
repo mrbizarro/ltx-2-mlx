@@ -18,15 +18,23 @@ class FeedForward(nn.Module):
 
     Architecture: Linear -> GELU_approx -> Linear
 
-    Weight keys: ``proj_in.{weight,bias}``, ``proj_out.{weight,bias}``
+    Weight keys: ``proj_in.{weight[,bias]}``, ``proj_out.{weight[,bias]}``
+
+    ``bias`` mirrors upstream's ``ff_bias`` flag. LTX-2.3 checkpoints carry
+    FFN biases (``bias=True``); LTX-2.5 (the gemma4 generation) sets
+    ``ff_bias=false`` and ships **no** ``proj_in.bias`` / ``proj_out.bias``
+    tensors at all. Building the biased module against a 2.5 checkpoint would
+    leave two randomly-initialised tensors per FFN per block — silent garbage,
+    not a load error — so the flag has to come from the checkpoint config
+    rather than a default.
     """
 
-    def __init__(self, dim: int, dim_out: int | None = None, mult: float = 4.0):
+    def __init__(self, dim: int, dim_out: int | None = None, mult: float = 4.0, bias: bool = True):
         super().__init__()
         dim_out = dim_out or dim
         inner_dim = int(dim * mult)
-        self.proj_in = nn.Linear(dim, inner_dim)
-        self.proj_out = nn.Linear(inner_dim, dim_out)
+        self.proj_in = nn.Linear(dim, inner_dim, bias=bias)
+        self.proj_out = nn.Linear(inner_dim, dim_out, bias=bias)
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.proj_out(nn.gelu_approx(self.proj_in(x)))
