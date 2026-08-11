@@ -185,12 +185,18 @@ def detect_text_encoder(model_path) -> TextEncoderSpec:
 
 
 def resolve_text_tower(spec: TextEncoderSpec) -> str:
-    """Return the mlx-lm architecture name to build, or raise with a fix.
+    """Return the architecture to build, or raise with a fix.
 
     Deliberately loud. Silently loading a Gemma 3 tower for a checkpoint that
     declares Gemma 4 would produce a model that runs, renders, and is subtly
     wrong in a way no user could diagnose — the single worst outcome available
     here. A clear failure that names the missing piece is strictly better.
+
+    Gemma 4 resolves to the **vendored** tower in
+    :mod:`ltx_core_mlx.text_encoders.gemma.gemma4`, not to ``mlx_lm.models``.
+    That is not a stylistic choice: no mlx-lm release provides a correct gemma4
+    at the ``mlx`` version this project pins. See that module's docstring for
+    the version matrix.
     """
     if spec.architecture in _KNOWN_GEMMA3:
         return spec.architecture
@@ -199,18 +205,14 @@ def resolve_text_tower(spec: TextEncoderSpec) -> str:
         try:
             import importlib
 
-            importlib.import_module("mlx_lm.models.gemma4")
-        except ImportError as exc:
+            importlib.import_module("ltx_core_mlx.text_encoders.gemma.gemma4")
+        except ImportError as exc:  # pragma: no cover — vendored, always present
             raise NotImplementedError(
                 "This checkpoint's text encoder declares "
-                f"model_type={spec.model_type!r} (Gemma 4), which the installed "
-                "mlx-lm cannot build — it has no `mlx_lm.models.gemma4`. LTX-2.5 "
-                "ships a custom Gemma 4 12B fine-tune, so falling back to the "
-                "Gemma 3 tower would encode every prompt with the wrong text "
-                "encoder and degrade quality silently. Install an mlx-lm that "
-                "implements gemma4, or vendor the text tower, then retry.\n"
-                "Note: mlx-lm is pinned alongside mlx here (the 0.31.2 vocoder "
-                "regression), so an upgrade is a deliberate, tested change."
+                f"model_type={spec.model_type!r} (Gemma 4), and the vendored "
+                "Gemma 4 tower could not be imported. Falling back to the Gemma 3 "
+                "tower would encode every prompt with the wrong text encoder and "
+                "degrade quality silently, so this refuses instead."
             ) from exc
         return "gemma4"
 
@@ -229,9 +231,9 @@ def load_text_encoder(model_path, spec: TextEncoderSpec | None = None):
     from ltx_core_mlx.text_encoders.gemma.encoders.base_encoder import GemmaLanguageModel
 
     spec = spec or detect_text_encoder(model_path)
-    resolve_text_tower(spec)  # raises before any weights are touched
+    architecture = resolve_text_tower(spec)  # raises before any weights are touched
 
-    encoder = GemmaLanguageModel(model_path)
+    encoder = GemmaLanguageModel(model_path, architecture=architecture)
     encoder.load()
     return encoder
 

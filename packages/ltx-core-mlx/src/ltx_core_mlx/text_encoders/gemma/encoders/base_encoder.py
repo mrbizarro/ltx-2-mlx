@@ -1,6 +1,13 @@
-"""Gemma 3 language model wrapper via mlx-lm.
+"""Gemma language model wrapper — Gemma 3 via mlx-lm, Gemma 4 vendored.
 
 Ported from ltx-core/src/ltx_core/text_encoders/gemma/encoders/base_encoder.py
+
+Which tower a checkpoint gets is decided by
+:func:`ltx_core_mlx.text_encoders.gemma.loader.resolve_text_tower`, never here.
+Gemma 3 (LTX-2.3) keeps exactly the mlx-lm path it always had. Gemma 4 (LTX-2.5)
+is built from the vendored tower, because no mlx-lm release ships a correct
+gemma4 at the ``mlx`` version this project pins — see
+:mod:`ltx_core_mlx.text_encoders.gemma.gemma4`.
 """
 
 from __future__ import annotations
@@ -14,35 +21,69 @@ import mlx.nn as nn
 
 
 class GemmaLanguageModel(nn.Module):
-    """Wrapper around Gemma 3 12B loaded via mlx-lm.
+    """Wrapper around a Gemma text tower — 12B Gemma 3 or Gemma 4.
 
-    Uses mlx_lm.load() for native MLX loading.
     Extracts hidden states from ALL layers for multi-layer feature extraction.
-
-    Gemma 3 12B has 48 transformer layers + embedding layer = 49 total
+    Both 12B towers have 48 transformer layers + the embedding layer = 49 total
     hidden states (embedding output + 48 layer outputs), each of dim 3840.
 
     Args:
-        model_path: Path to the Gemma 3 MLX weights directory.
+        model_path: Path to the Gemma MLX weights directory.
+        architecture: ``"gemma3"`` / ``"gemma3_text"`` (mlx-lm) or ``"gemma4"``
+            (vendored). ``None`` detects it from the directory's ``config.json``.
     """
 
-    def __init__(self, model_path: str | Path | None = None):
+    def __init__(
+        self,
+        model_path: str | Path | None = None,
+        architecture: str | None = None,
+    ):
         super().__init__()
         self._model = None
         self._tokenizer = None
         self._model_path = str(model_path) if model_path else None
+        self._architecture = architecture
+
+    @property
+    def architecture(self) -> str | None:
+        """Which tower is loaded — resolved at load time when not supplied."""
+        return self._architecture
+
+    @property
+    def is_gemma4(self) -> bool:
+        return self._architecture == "gemma4"
 
     def load(self, model_path: str | None = None) -> None:
-        """Load the Gemma model via mlx-lm.
+        """Load the Gemma model.
+
+        Gemma 3 goes through ``mlx_lm.load``, unchanged. Gemma 4 goes through the
+        vendored tower plus mlx-lm's architecture-agnostic tokenizer loader —
+        ``mlx_lm.load`` would reject it outright on the pinned mlx-lm, which has
+        no gemma4 at all.
 
         Args:
             model_path: Path or HuggingFace repo ID.
         """
-        from mlx_lm import load as mlx_lm_load
-
         path = model_path or self._model_path
         if path is None:
             raise ValueError("model_path must be provided")
+
+        if self._architecture is None:
+            from ltx_core_mlx.text_encoders.gemma.loader import (
+                detect_text_encoder,
+                resolve_text_tower,
+            )
+
+            self._architecture = resolve_text_tower(detect_text_encoder(path))
+
+        if self.is_gemma4:
+            from ltx_core_mlx.text_encoders.gemma.gemma4_pack import load_gemma4_tower
+
+            self._model = load_gemma4_tower(path)
+            self._tokenizer = _load_tokenizer(path)
+            return
+
+        from mlx_lm import load as mlx_lm_load
 
         self._model, self._tokenizer = mlx_lm_load(path)
 
@@ -118,6 +159,14 @@ class GemmaLanguageModel(nn.Module):
             raise RuntimeError("Model not loaded. Call load() first.")
 
         self._ensure_metal_headroom()
+
+        # Gemma 4 owns this walk. Its blocks are not drop-in callable the way
+        # Gemma 3's are: they return (hidden, kv), late layers may need another
+        # layer's K/V, small variants need per-layer input embeddings, and the
+        # sliding/full layers want different masks. Driving them from a generic
+        # loop is how you get a tower that runs and encodes wrongly.
+        if self.is_gemma4:
+            return self._model.all_hidden_states(token_ids, attention_mask=attention_mask)
 
         # Navigate to the inner model with embed_tokens and layers.
         inner = self._model
@@ -278,6 +327,16 @@ class GemmaLanguageModel(nn.Module):
         if self._model is None or self._tokenizer is None:
             raise RuntimeError("Model not loaded. Call load() first.")
 
+        if self.is_gemma4:
+            # The vendored tower is an encoder: no KV cache, no lm_head, no
+            # sampling loop — deliberately, because that is all LTX needs of it.
+            # Prompt enhancement runs on its own Gemma root and is unaffected.
+            raise NotImplementedError(
+                "Prompt enhancement is not available on the vendored Gemma 4 tower "
+                "(it builds the text-encoder path only — no lm_head, no KV cache). "
+                "Point the enhancer at a Gemma 3 root, which is how it already runs."
+            )
+
         from mlx_lm import generate as mlx_generate
         from mlx_lm.sample_utils import make_sampler
 
@@ -309,6 +368,33 @@ class GemmaLanguageModel(nn.Module):
     def default_gemma_i2v_system_prompt(self) -> str:
         """Load the default I2V system prompt."""
         return _load_system_prompt("gemma_i2v_system_prompt.txt")
+
+
+def _load_tokenizer(model_path: str):
+    """Load a tokenizer without going through an architecture-aware loader.
+
+    ``mlx_lm.load`` refuses a checkpoint whose ``model_type`` it cannot build, so
+    it cannot be used to fetch a Gemma 4 tokenizer on the pinned mlx-lm. The
+    tokenizer itself is architecture-agnostic — it comes from ``tokenizer.json``
+    / ``tokenizer_config.json`` sitting beside the weights.
+
+    LTX-2.5 ships its text encoder as its own repo, so the tokenizer is expected
+    to travel *with* the encoder rather than be shared with 2.3's Gemma 3 root.
+    That is asserted, not assumed: a missing tokenizer raises here instead of
+    silently reaching for a Gemma 3 vocabulary, which would tokenize every prompt
+    into the wrong ids.
+    """
+    from mlx_lm.tokenizer_utils import load as load_tokenizer
+
+    try:
+        return load_tokenizer(Path(model_path))
+    except Exception as exc:  # noqa: BLE001 — re-raised with the actionable message
+        raise RuntimeError(
+            f"No usable tokenizer beside the text encoder at {model_path!r} "
+            f"({type(exc).__name__}: {exc}). LTX-2.5's encoder is expected to ship "
+            "its own tokenizer files; borrowing Gemma 3's would silently produce "
+            "the wrong token ids for every prompt."
+        ) from exc
 
 
 @functools.lru_cache(maxsize=2)

@@ -15,6 +15,7 @@ to raise, and there is a test that it does.
 from __future__ import annotations
 
 import json
+import sys
 
 import mlx.core as mx
 import pytest
@@ -116,16 +117,31 @@ class TestResolveTextTower:
         spec = detect_text_encoder(write_config(tmp_path, GEMMA3_CONFIG))
         assert resolve_text_tower(spec) == "gemma3"
 
-    def test_gemma4_fails_loud_when_the_runtime_cannot_build_it(self, tmp_path):
-        """Never a silent Gemma 3 fallback. A wrong TE is undiagnosable."""
+    def test_gemma4_resolves_to_the_vendored_tower(self, tmp_path):
+        """Was: "fails loud when the runtime cannot build it".
+
+        It can now — ``ltx_core_mlx.text_encoders.gemma.gemma4`` is vendored
+        precisely because no mlx-lm release provides a correct gemma4 at the
+        ``mlx`` version this project pins. Resolution no longer depends on the
+        installed mlx-lm at all.
+        """
         spec = detect_text_encoder(write_config(tmp_path, GEMMA4_UNIFIED_CONFIG))
-        try:
-            import mlx_lm.models.gemma4  # noqa: F401
-        except ImportError:
-            with pytest.raises(NotImplementedError, match="gemma4"):
-                resolve_text_tower(spec)
-        else:
-            assert resolve_text_tower(spec) == "gemma4"
+        assert resolve_text_tower(spec) == "gemma4"
+
+    def test_gemma4_never_silently_falls_back_to_gemma3(self, tmp_path):
+        """The load-bearing refusal, unchanged: a wrong TE is undiagnosable.
+
+        Falling back to Gemma 3 would not crash — renders would merely get
+        worse, and no user could ever attribute it.
+        """
+        spec = detect_text_encoder(write_config(tmp_path, GEMMA4_UNIFIED_CONFIG))
+        assert "gemma3" not in resolve_text_tower(spec)
+
+    def test_gemma4_resolution_does_not_depend_on_mlx_lm(self, tmp_path, monkeypatch):
+        """Hiding ``mlx_lm.models.gemma4`` must not change the answer."""
+        monkeypatch.setitem(sys.modules, "mlx_lm.models.gemma4", None)
+        spec = detect_text_encoder(write_config(tmp_path, GEMMA4_UNIFIED_CONFIG))
+        assert resolve_text_tower(spec) == "gemma4"
 
     def test_unknown_model_type_raises(self, tmp_path):
         spec = detect_text_encoder(write_config(tmp_path, dict(GEMMA3_CONFIG, model_type="llama9")))
