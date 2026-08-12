@@ -62,6 +62,19 @@ def resolve_lora_path(path: str) -> str:
     return str(safetensors_files[0])
 
 
+def transformer_pack_is_quantized(transformer_path: str | Path) -> bool:
+    """True when a transformer safetensors carries quantized weights.
+
+    Reads only the safetensors **header** — a ``.scales`` tensor is the
+    signature of an MLX-quantized linear. Used to pick a LoRA application mode
+    before any weight is materialised.
+    """
+    from safetensors import safe_open
+
+    with safe_open(str(transformer_path), framework="numpy") as handle:
+        return any(key.endswith(".scales") for key in handle.keys())
+
+
 def fuse_pending_loras(
     transformer_weights: dict[str, mx.array],
     lora_paths: list[tuple[str, float]],

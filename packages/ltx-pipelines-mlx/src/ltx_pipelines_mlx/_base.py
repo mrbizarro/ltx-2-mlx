@@ -73,6 +73,10 @@ class BasePipeline:
         self.low_ram_streaming = low_ram_streaming
         self.verbose = verbose
         self._loaded = False
+        #: How ``_pending_loras`` are applied. ``"auto"`` (default) picks the
+        #: unfused runtime branch on a quantized pack and weight fusion on a
+        #: float one. See :mod:`ltx_core_mlx.loader.runtime_loras`.
+        self.lora_mode = "auto"
 
         if self.low_ram_streaming:
             # Disable Metal heap cache before any allocation. With cache enabled,
@@ -200,6 +204,34 @@ class BasePipeline:
 
         return _impl(transformer_weights, lora_paths)
 
+    def _resolve_lora_mode(self, transformer_path: Path) -> str:
+        """Turn ``self.lora_mode`` into ``"unfused"`` or ``"fuse"`` for this pack.
+
+        ``auto`` reads the checkpoint **header** — a ``.scales`` key means the
+        pack is quantized, and fusing a LoRA into it would round most of the
+        delta away. No weights are materialised to decide.
+        """
+        from ltx_core_mlx.loader.runtime_loras import LORA_MODES
+        from ltx_pipelines_mlx.utils._orchestration import transformer_pack_is_quantized
+
+        mode = getattr(self, "lora_mode", "auto")
+        if mode not in LORA_MODES:
+            raise ValueError(f"lora_mode must be one of {LORA_MODES}, got {mode!r}")
+        if mode != "auto":
+            return mode
+        return "unfused" if transformer_pack_is_quantized(transformer_path) else "fuse"
+
+    def _attach_pending_loras(self, dit: LTXModel, lora_paths: list[tuple[str, float]]) -> None:
+        """Attach pending LoRAs to a built DiT as unfused runtime branches."""
+        from ltx_core_mlx.loader.runtime_loras import load_and_attach_loras
+        from ltx_pipelines_mlx.utils._orchestration import resolve_lora_path
+
+        resolved = [(resolve_lora_path(path), strength) for path, strength in lora_paths]
+        load_and_attach_loras(dit, resolved, verbose=self.verbose)
+        _materialize = getattr(mx, "eval")  # noqa: B009 -- mx.eval is the MLX graph materialiser
+        _materialize(dit.parameters())
+        aggressive_cleanup()
+
     # ------------------------------------------------------------------
     # Shared component loading methods (used by subclass pipelines)
     # ------------------------------------------------------------------
@@ -291,14 +323,24 @@ class BasePipeline:
 
         The single entry point for DiT construction across every pipeline's
         ``load()``. Routes through :func:`utils._orchestration.load_transformer`
-        when no LoRAs are pending, or fuses LoRA deltas into the weight dict
-        before quantization when ``self._pending_loras`` is set by the CLI.
+        when no LoRAs are pending; otherwise applies them in the mode
+        ``self.lora_mode`` resolves to:
+
+        - **unfused** (``auto``'s answer on a quantized pack) — the model is
+          built and loaded clean, then the LoRA rides as a runtime low-rank
+          branch on the targeted linears. Exact at any bit width.
+        - **fuse** (``auto``'s answer on a float pack) — deltas are merged into
+          the weight dict before quantization, as before. Free and exact on
+          bf16; **lossy on quantized**, which is why it is no longer the
+          default there (94.9 % of a rank-32 delta destroyed at q4).
 
         In ``low_ram_streaming`` mode, LoRAs are attached as
         :class:`BlockLoraSource` objects on the :class:`StreamingLTXModel`
-        wrapper — fusion happens per-block at each bind rather than
-        materialising the full weight dict. This mirrors
-        :meth:`ICLoraPipeline._fuse_loras`'s streaming branch.
+        wrapper — bind-time fusion, per block. The runtime branch cannot be
+        used there: the streamer rebinds one shared block's weights by
+        state-dict path every forward, and it would have to swap the adapter's
+        A/B per block to match. An explicit ``--lora-mode unfused`` under
+        ``--low-ram`` therefore **raises** rather than quietly fusing.
         """
         pending_loras = getattr(self, "_pending_loras", None)
         with phase(f"Loading transformer ({transformer_path.name})", verbose=self.verbose):
@@ -316,6 +358,14 @@ class BasePipeline:
                 from ltx_pipelines_mlx.utils._orchestration import load_transformer as _load_impl
                 from ltx_pipelines_mlx.utils._orchestration import resolve_lora_path
 
+                if getattr(self, "lora_mode", "auto") == "unfused":
+                    raise ValueError(
+                        "lora_mode='unfused' is not supported with low_ram_streaming: the "
+                        "block streamer rebinds one shared block per forward and cannot "
+                        "carry per-block LoRA adapters yet. Drop --low-ram to get the "
+                        "exact unfused branch, or accept bind-time fusion with "
+                        "--lora-mode fuse (lossy on quantized packs)."
+                    )
                 model = _load_impl(transformer_path, low_ram_streaming=True)
                 sources: list = list(object.__getattribute__(model, "_lora_sources"))
                 for lora_path, strength in pending_loras:
@@ -330,6 +380,13 @@ class BasePipeline:
                     )
                 object.__setattr__(model, "_lora_sources", sources)
                 return model
+
+            if self._resolve_lora_mode(transformer_path) == "unfused":
+                from ltx_pipelines_mlx.utils._orchestration import load_transformer as _impl
+
+                dit = _impl(transformer_path, low_ram_streaming=False)
+                self._attach_pending_loras(dit, pending_loras)
+                return dit
 
             transformer_weights = load_split_safetensors(transformer_path, prefix="transformer.")
             transformer_weights = self._fuse_pending_loras(transformer_weights, pending_loras)

@@ -28,6 +28,13 @@ def pipeline_stub():
     class _Stub:
         verbose = False
         low_ram_streaming = False
+        # Weight fusion is no longer the default: `lora_mode="auto"` routes a
+        # quantized pack to the unfused runtime branch, because fusing into q4
+        # destroys ~95 % of the delta. The fusion dispatch pinned below is now
+        # reached via the explicit `fuse` mode; the auto / unfused dispatch is
+        # pinned in tests/test_runtime_loras.py.
+        lora_mode = "fuse"
+        _resolve_lora_mode = BasePipeline._resolve_lora_mode
 
         def _fuse_pending_loras(self, weights, pending):
             # Spy: record the call, return a tagged dict so we can assert

@@ -43,8 +43,9 @@ packages/
 │       ├── guidance/                      # Guidance utilities
 │       │   └── perturbations.py           # Noise perturbation strategies
 │       │
-│       ├── loader/                        # Weight loading & LoRA fusion
-│       │   ├── fuse_loras.py              # LoRA weight fusion
+│       ├── loader/                        # Weight loading & LoRA application
+│       │   ├── fuse_loras.py              # LoRA weight fusion (lossy on quantized)
+│       │   ├── runtime_loras.py           # Unfused runtime LoRA branch (exact at any quant)
 │       │   ├── primitives.py              # Loading primitives
 │       │   ├── sd_ops.py                  # Safetensors loading operations
 │       │   └── sft_loader.py              # Split safetensors loader
@@ -205,6 +206,43 @@ Weights are pre-converted by [mlx-forge](https://github.com/dgrauet/mlx-forge) a
 - Non-quantizable (must stay bf16): `adaln_single`, `proj_out`, `patchify_proj`, connectors, VAE, vocoder
 - MLX can only quantize Linear and Embedding — never Conv layers
 - Loaders derive `(bits, group_size)` from tensor shapes → any group_size (32/64/128) + bit width (int4/int8) loads & fuses. Single home: `utils/weights.py::derive_quant_params` (exact-consistency validated); shared by load-time quant + LoRA fusion.
+
+### LoRA application mode — `--lora-mode` (NON-NEGOTIABLE on quantized packs)
+
+**Never fuse a LoRA into a quantized weight without meaning to.** `quantize(dequantize(W) + B@A)`
+rounds most of the delta straight back onto the grid it came from. Measured on the real packs with
+a rank-32 character LoRA (`‖B@A‖/‖W‖ ≈ 0.08`):
+
+| pack | bits | LoRA delta destroyed |
+|---|---|---|
+| `ltx-2.3-mlx-q4` / `ltx-2.5-mlx-q4` | 4 | **94.9 % / 92.7 %** |
+| `ltx-2.3-mlx-q8` / `ltx-2.5-mlx-q8` | 8 | 10.2 % / 9.8 % |
+| bf16 | — | ~2 % (bfloat16 ULP) |
+
+That is what makes character LoRAs "stop triggering" at q4 — two investigations were spent on it.
+
+| Mode | What it does | When |
+|---|---|---|
+| `unfused` | `y = base(x) + s·B(A x)` at run time; the weight is never touched | **Default on any quantized pack.** Exact at any bit width |
+| `fuse` | merges `B@A` into the weight tensor | Default on a float pack (free + exact there); on a quantized pack it is the honest A/B control arm, and it warns |
+| `auto` | reads the checkpoint header: `.scales` present → `unfused`, else `fuse` | default |
+
+- Library entry point: `loader/runtime_loras.py::attach_loras` / `load_and_attach_loras`, applied **after**
+  `apply_quantization` + `load_weights`. Pipeline seam: `BasePipeline.lora_mode` +
+  `_load_transformer_with_optional_streaming`.
+- **The adapters keep the base module's state-dict paths** (`…to_q.weight` stays `…to_q.weight`; only
+  `…to_q.lora_a` / `.lora_b` are added). This is load-bearing: two-stage stage 2 fuses the rank-384
+  distilled LoRA into the live DiT afterwards by matching `X.lora_A.weight` against `X.weight`. A
+  wrapper module that renamed the target to `…to_q.base.weight` would have dropped that fusion on every
+  attention projection, silently. Pinned by
+  `tests/test_runtime_loras.py::test_a_later_weight_fusion_still_finds_the_attached_modules`.
+- `apply_loras` now **measures** the delta it destroys on the first 8 quantized fusions and shouts above
+  25 %. `quantized_ok=True` acknowledges it. A LoRA that matches 0 modules is always reported (#52).
+- **Not available with `--low-ram`**: the block streamer rebinds one shared block per forward and would
+  need per-block adapters. `--lora-mode unfused --low-ram` raises rather than quietly fusing.
+- Cost: `r·(in+out)/(in·out)` extra FLOPs = **1.56 %** at rank 32 on a 4096 projection. The add is fused
+  via `mx.addmm` — a separate `y + delta` triples the epilogue's memory traffic and costs ~17 % wall
+  clock instead of ~3 %. Bench: `scripts/bench_runtime_lora.py` (no GPU lock needed).
 
 ### Split Safetensors
 
@@ -750,7 +788,8 @@ Uses the distilled model (no CFG) with LoRA fused for Stage 1 only.
 - `ic_lora.py` — `ICLoraPipeline` (extends `BasePipeline`)
 - `conditioning/types/reference_video_cond.py` — `VideoConditionByReferenceLatent`
 - `conditioning/types/attention_strength_wrapper.py` — `ConditioningItemAttentionStrengthWrapper`
-- `loader/fuse_loras.py` — LoRA weight fusion with quantization support
+- `loader/fuse_loras.py` — LoRA weight fusion with quantization support (lossy — see "LoRA application mode")
+- `loader/runtime_loras.py` — the unfused runtime branch, exact on quantized packs
 - `loader/sd_ops.py` — `LTXV_LORA_COMFY_RENAMING_MAP`
 
 ---

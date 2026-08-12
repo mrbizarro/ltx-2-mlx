@@ -271,6 +271,19 @@ examples:
             "or a HuggingFace repo ID. Example: --lora my_lora.safetensors 1.0"
         ),
     )
+    gen.add_argument(
+        "--lora-mode",
+        choices=("auto", "unfused", "fuse"),
+        default="auto",
+        help=(
+            "How to apply --lora. 'unfused' keeps the low-rank branch out of the weight "
+            "and evaluates it at run time — exact at any quantization, ~1.5%% extra FLOPs "
+            "at rank 32. 'fuse' merges it into the weight: free and exact on bf16, but it "
+            "destroys ~95%% of a rank-32 delta on a q4 pack (~10%% on q8), which is what "
+            "makes character LoRAs 'stop triggering'. 'auto' (default) = unfused on a "
+            "quantized pack, fuse on a float one. Not available with --low-ram."
+        ),
+    )
 
     # --- a2v (Audio-to-Video) ---
     a2v = sub.add_parser("a2v", help="[beta] Generate video from audio + text prompt")
@@ -711,6 +724,7 @@ def _cmd_generate(args: argparse.Namespace) -> None:
         pipe.verbose = not args.quiet
         if lora_paths:
             pipe._pending_loras = lora_paths
+            pipe.lora_mode = args.lora_mode
         kwargs: dict = dict(
             prompt=prompt,
             output_path=args.output,
@@ -751,6 +765,7 @@ def _cmd_generate(args: argparse.Namespace) -> None:
         pipe.verbose = not args.quiet
         if lora_paths:
             pipe._pending_loras = lora_paths
+            pipe.lora_mode = args.lora_mode
         kwargs: dict = dict(
             prompt=prompt,
             output_path=args.output,
@@ -796,6 +811,7 @@ def _cmd_generate(args: argparse.Namespace) -> None:
         pipe.verbose = not args.quiet
         if lora_paths:
             pipe._pending_loras = lora_paths
+            pipe.lora_mode = args.lora_mode
         # two-stage / HQ accept the upstream-iso multi-image conditioning list.
         # Pass the list through; the legacy single-image path is handled inside
         # the pipeline (image=None when images is set).

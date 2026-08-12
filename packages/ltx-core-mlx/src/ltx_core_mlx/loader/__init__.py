@@ -15,23 +15,41 @@ from ltx_core_mlx.loader.sd_ops import (
     SDKeyValueOperation,
     SDOps,
 )
+from ltx_core_mlx.loader.runtime_loras import (
+    LORA_MODES,
+    LoRALinear,
+    LoRAQuantizedLinear,
+    RuntimeLoraReport,
+    attach_loras,
+    load_and_attach_loras,
+    model_has_quantized_linears,
+    resolve_lora_mode,
+)
 from ltx_core_mlx.loader.sft_loader import (
     SafetensorsModelStateDictLoader,
     SafetensorsStateDictLoader,
 )
 
 __all__ = [
+    "LORA_MODES",
     "LTXV_LORA_BLOCK_PREFIX",
     "LTXV_LORA_COMFY_RENAMING_MAP",
     "ContentMatching",
     "ContentReplacement",
     "KeyValueOperationResult",
+    "LoRALinear",
+    "LoRAQuantizedLinear",
     "LoraPathStrengthAndSDOps",
     "LoraStateDictWithStrength",
+    "RuntimeLoraReport",
     "SDKeyValueOperation",
     "SDOps",
     "SafetensorsModelStateDictLoader",
     "SafetensorsStateDictLoader",
     "StateDict",
     "apply_loras",
+    "attach_loras",
+    "load_and_attach_loras",
+    "model_has_quantized_linears",
+    "resolve_lora_mode",
 ]
