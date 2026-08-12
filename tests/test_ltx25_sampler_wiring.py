@@ -366,16 +366,23 @@ def test_stage2_resolution_is_version_keyed_and_defaults_to_23():
     assert resolve_stage2_sigmas(()) == STAGE_2_SIGMAS
 
 
-def test_stage2_truncation_keeps_the_pre_existing_semantics():
-    """The old call site was ``STAGE_2_SIGMAS[: n + 1] if n else STAGE_2_SIGMAS``,
-    including the wart that a truncated schedule no longer ends at 0.0. Changing
-    that here would be a second behaviour change smuggled in under the first."""
+def test_stage2_step_counts_thin_rather_than_truncate():
+    """This test used to pin the opposite, deliberately, and that is worth keeping
+    in view: when the 2.5 stage-2 first sigma landed, the truncation wart
+    (``STAGE_2_SIGMAS[: n + 1]``, which drops the terminal 0.0) was left exactly
+    as it was so that one commit carried one behaviour change.
+
+    Experiment 5 then measured what the wart costs — ``--stage2-steps 2`` was an
+    *unfinished refine*, not a two-step one — and it was fixed on 2026-08-12.
+    A step count now thins the table and the terminal 0.0 always survives.
+    Ownership of that assertion moves to tests/test_distilled_schedule.py; what
+    stays here is the version-keying, which is this file's subject."""
     from ltx_pipelines_mlx.scheduler import STAGE_2_SIGMAS, resolve_stage2_sigmas
 
-    for n in (None, 0, 1, 2, 3, 9):
-        expected = STAGE_2_SIGMAS[: n + 1] if n else STAGE_2_SIGMAS
-        assert resolve_stage2_sigmas((2, 3), n) == expected
-    assert resolve_stage2_sigmas((2, 5), 2) == [0.85, 0.725, 0.421875]  # no terminal 0.0, as before
+    for n in (None, 0, 1, 2, 3):
+        assert resolve_stage2_sigmas((2, 3), n)[-1] == 0.0
+    assert resolve_stage2_sigmas((2, 3), 3) == STAGE_2_SIGMAS
+    assert resolve_stage2_sigmas((2, 5), 2) == [0.85, 0.421875, 0.0]
 
 
 def test_audio_rate_25_is_tokens_per_second_not_a_video_frame_rate():

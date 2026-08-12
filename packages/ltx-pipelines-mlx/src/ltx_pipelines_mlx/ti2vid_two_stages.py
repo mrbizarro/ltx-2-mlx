@@ -615,6 +615,9 @@ class TI2VidTwoStagesPipeline(BasePipeline):
         seed: int = 42,
         stage1_steps: int | None = None,
         stage2_steps: int | None = None,
+        stage1_sigmas=None,
+        stage2_sigmas=None,
+        schedule_preset: str | None = None,
         cfg_scale: float = DEFAULT_CFG_SCALE,
         stg_scale: float = 1.0,
         image: str | None = None,
@@ -633,6 +636,12 @@ class TI2VidTwoStagesPipeline(BasePipeline):
 
         ``prompt_relay`` (a ``PromptRelayInput``) is forwarded only when set;
         ``generate_two_stage`` wires the mask into both of its denoise loops.
+
+        ``stage1_sigmas`` / ``stage2_sigmas`` / ``schedule_preset`` are the
+        distilled lane's explicit-schedule inputs. They are forwarded **only
+        when set**, so this parent's own ``generate_two_stage`` — which sizes
+        stage 1 from a step count via ``ltx2_schedule`` and has no use for a
+        fixed table — never sees them.
         """
         gen_kwargs: dict = dict(
             prompt=prompt,
@@ -655,6 +664,12 @@ class TI2VidTwoStagesPipeline(BasePipeline):
             gen_kwargs["stage1_steps"] = stage1_steps
         if prompt_relay is not None:
             gen_kwargs["prompt_relay"] = prompt_relay
+        if stage1_sigmas is not None:
+            gen_kwargs["stage1_sigmas"] = stage1_sigmas
+        if stage2_sigmas is not None:
+            gen_kwargs["stage2_sigmas"] = stage2_sigmas
+        if schedule_preset is not None:
+            gen_kwargs["schedule_preset"] = schedule_preset
         video_latent, audio_latent = self.generate_two_stage(**gen_kwargs)
 
         # Free transformer + encoder to make room for decoders

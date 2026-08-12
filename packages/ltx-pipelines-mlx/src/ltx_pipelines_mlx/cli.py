@@ -25,6 +25,11 @@ import time
 DEFAULT_MODEL = "dgrauet/ltx-2.3-mlx-q8"
 DEFAULT_GEMMA = "mlx-community/gemma-3-12b-it-4bit"
 
+# Mirrors ``scheduler.DISTILLED_PRESET_NAMES``. Copied rather than imported so
+# that `ltx-2-mlx --help` still costs no MLX import; the copy is pinned by
+# tests/test_distilled_schedule.py::test_cli_preset_choices_match_the_scheduler.
+_DISTILLED_PRESET_NAMES = ("default", "fast", "vendor")
+
 
 def _add_base_args(parser: argparse.ArgumentParser) -> None:
     """Add base arguments shared by all subcommands (prompt, output, model, seed)."""
@@ -57,6 +62,25 @@ def _build_tile_count_config(args: argparse.Namespace):
         height=DimensionTilingConfig(num_tiles=spatial_n, overlap=overlap if spatial_n > 1 else 0),
         width=DimensionTilingConfig(num_tiles=spatial_n, overlap=overlap if spatial_n > 1 else 0),
     )
+
+
+def _parse_sigma_list(raw: str, flag: str) -> list[float]:
+    """Parse and validate a comma-separated sigma schedule from the command line.
+
+    Validation runs here, before any weight is loaded, so a typo costs a second
+    instead of a Gemma load. The pipeline validates again — a library caller
+    never passes through this function.
+    """
+    from ltx_pipelines_mlx.scheduler import DISTILLED_MAX_POINTS, validate_sigmas
+
+    try:
+        values = [float(v) for v in raw.replace(" ", "").split(",") if v != ""]
+    except ValueError as exc:
+        raise SystemExit(f"{flag}: expected comma-separated numbers, got {raw!r} ({exc})") from exc
+    try:
+        return validate_sigmas(values, name=flag, max_points=DISTILLED_MAX_POINTS)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _add_generation_args(parser: argparse.ArgumentParser) -> None:
@@ -222,6 +246,36 @@ examples:
     )
     gen.add_argument("--stage1-steps", type=int, default=None, help="Stage 1 steps (default: 30 standard, 15 HQ)")
     gen.add_argument("--stage2-steps", type=int, default=None, help="Stage 2 steps (default: 3)")
+    gen.add_argument(
+        "--stage1-sigmas",
+        default=None,
+        metavar="S,S,...",
+        help=(
+            "--distilled only: explicit stage-1 sigma schedule, comma-separated. Must be "
+            "strictly decreasing, start at or below 1.0, END AT 0.0, and hold at most the "
+            "distilled checkpoint's 9 points. E.g. 1.0,0.975,0.909375,0.725,0.421875,0.0"
+        ),
+    )
+    gen.add_argument(
+        "--stage2-sigmas",
+        default=None,
+        metavar="S,S,...",
+        help=(
+            "--distilled only: explicit stage-2 sigma schedule, same rules. Note the first "
+            "value is also the re-noising level (LTX-2.5: 0.85 keeps 15%% of stage 1)."
+        ),
+    )
+    gen.add_argument(
+        "--schedule-preset",
+        default=None,
+        choices=list(_DISTILLED_PRESET_NAMES),
+        help=(
+            "--distilled only: named sigma schedule. LTX-2.5: 'default' 8+2 (graded, -17%% "
+            "wall vs the vendor list, same take), 'fast' 5+2 (-29%%, DIFFERENT take — "
+            "drafts), 'vendor' 8+3 (the pre-2026-08-12 default). LTX-2.3 offers 'default' / "
+            "'vendor' only, both its own vendor schedule."
+        ),
+    )
     gen.add_argument("--cfg-scale", type=float, default=None, help="CFG guidance scale (default: 3.0)")
     gen.add_argument(
         "--stg-scale",
@@ -706,6 +760,33 @@ def _cmd_generate(args: argparse.Namespace) -> None:
     if sum(map(bool, (args.two_stages_hq, args.two_stage, args.distilled, args.one_stage))) > 1:
         raise SystemExit("Choose at most one of --two-stage, --two-stages-hq, --distilled, --one-stage.")
 
+    schedule_flags = [
+        name
+        for name, value in (
+            ("--stage1-sigmas", args.stage1_sigmas),
+            ("--stage2-sigmas", args.stage2_sigmas),
+            ("--schedule-preset", args.schedule_preset),
+        )
+        if value is not None
+    ]
+    if schedule_flags and not args.distilled:
+        raise SystemExit(
+            f"{', '.join(schedule_flags)} apply to --distilled only. The dev lanes size stage 1 "
+            "from --stage1-steps through ltx2_schedule (a computed schedule, not a fixed table), "
+            "and their refine schedule has not been graded on a thinned list."
+        )
+    # Parsed HERE, before any pipeline is constructed: constructing one resolves
+    # the model directory, which on a HuggingFace id starts a download. A typo in
+    # a sigma list must not cost 26 GB before it is reported.
+    stage1_sigmas = _parse_sigma_list(args.stage1_sigmas, "--stage1-sigmas") if args.stage1_sigmas else None
+    stage2_sigmas = _parse_sigma_list(args.stage2_sigmas, "--stage2-sigmas") if args.stage2_sigmas else None
+    for stage, sigmas, steps in ((1, stage1_sigmas, args.stage1_steps), (2, stage2_sigmas, args.stage2_steps)):
+        if sigmas is not None and steps is not None:
+            raise SystemExit(
+                f"pass either --stage{stage}-sigmas or --stage{stage}-steps, not both: an explicit "
+                f"schedule already says how many steps it has."
+            )
+
     if args.one_stage:
         from ltx_pipelines_mlx.ti2vid_one_stage import TI2VidOneStagePipeline
 
@@ -780,6 +861,12 @@ def _cmd_generate(args: argparse.Namespace) -> None:
             kwargs["stage1_steps"] = args.stage1_steps
         if args.stage2_steps is not None:
             kwargs["stage2_steps"] = args.stage2_steps
+        if stage1_sigmas is not None:
+            kwargs["stage1_sigmas"] = stage1_sigmas
+        if stage2_sigmas is not None:
+            kwargs["stage2_sigmas"] = stage2_sigmas
+        if args.schedule_preset is not None:
+            kwargs["schedule_preset"] = args.schedule_preset
         if relay is not None:
             kwargs["prompt_relay"] = relay
         pipe.generate_and_save(**kwargs)

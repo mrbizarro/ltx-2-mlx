@@ -30,7 +30,7 @@ from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_
 
 from .ic_lora import ICLoraPipeline
 from .iclora_utils import append_ic_lora_reference_video_conditionings
-from .scheduler import DISTILLED_SIGMAS, STAGE_2_SIGMAS
+from .scheduler import DISTILLED_SIGMAS, STAGE_2_SIGMAS, thin_sigmas
 from .utils.helpers import create_noised_state
 from .utils.samplers import denoise_loop
 
@@ -240,7 +240,7 @@ class LipDubPipeline(ICLoraPipeline):
         )
         audio_state = ref_cond.apply(audio_state, num_noisy_tokens=audio_T)
 
-        sigmas_1 = DISTILLED_SIGMAS[: stage1_steps + 1] if stage1_steps else DISTILLED_SIGMAS
+        sigmas_1 = thin_sigmas(DISTILLED_SIGMAS, stage1_steps, name="stage 1")
         x0_model = X0Model(self.dit)
         self._pre_denoise_flush(video_state, audio_state)
         output_1 = denoise_loop(
@@ -307,7 +307,7 @@ class LipDubPipeline(ICLoraPipeline):
         # Intentional divergence from ic_lora.py which reloads a clean transformer.
 
         video_tokens_up, _ = self.video_patchifier.patchify(video_upscaled)
-        sigmas_2 = STAGE_2_SIGMAS[: stage2_steps + 1] if stage2_steps else STAGE_2_SIGMAS
+        sigmas_2 = thin_sigmas(STAGE_2_SIGMAS, stage2_steps, name="stage 2")
         start_sigma = sigmas_2[0]
 
         video_positions_2 = compute_video_positions(F, H_full, W_full, frame_rate=frame_rate)

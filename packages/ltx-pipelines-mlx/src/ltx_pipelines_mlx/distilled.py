@@ -4,7 +4,13 @@ Mirrors upstream ``ltx_pipelines.distilled.DistilledPipeline`` 1:1:
 
   Stage 1: Distilled DiT at **half resolution** (8 steps, no CFG).
   Stage 2: Spatial 2x upscaler + distilled DiT refine at **full resolution**
-           (3 steps, no CFG).
+           (2 steps on LTX-2.5, 3 on 2.3, no CFG).
+
+Both schedules come from :func:`~ltx_pipelines_mlx.scheduler.resolve_distilled_schedule`,
+which is keyed on the checkpoint's generation. LTX-2.5's stage-2 default is the
+graded two-step list (experiment 5 arm S2, adopted 2026-08-12); 2.3 keeps the
+vendor 8+3 it always had. ``schedule_preset="fast"`` and explicit
+``stage1_sigmas`` / ``stage2_sigmas`` are the opt-ins on top.
 
 Same distilled checkpoint is used in both stages — no LoRA fusion between
 stages (the model is already distilled). Use this pipeline when you want
@@ -35,7 +41,7 @@ from ltx_core_mlx.utils.positions import (
     compute_video_positions,
 )
 
-from .scheduler import DISTILLED_SIGMAS, resolve_stage2_sigmas
+from .scheduler import resolve_distilled_schedule
 from .ti2vid_two_stages import TI2VidTwoStagesPipeline
 from .utils.helpers import create_noised_state
 from .utils.progress import phase
@@ -53,8 +59,9 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
 
     - Skip negative-prompt encoding (no CFG).
     - Load the distilled transformer directly (no dev model, no LoRA fusion).
-    - Run simple ``denoise_loop`` with ``DISTILLED_SIGMAS`` for stage 1.
-    - Run the same distilled transformer for stage 2 with ``STAGE_2_SIGMAS``.
+    - Run simple ``denoise_loop`` on both stages with the generation's schedule
+      pair from ``resolve_distilled_schedule`` (overridable by preset, by an
+      explicit sigma list, or by a step count that thins rather than truncates).
 
     Args:
         model_dir: Path to model weights or HuggingFace repo ID. Must
@@ -119,6 +126,9 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         seed: int = 42,
         stage1_steps: int | None = None,
         stage2_steps: int | None = None,
+        stage1_sigmas=None,
+        stage2_sigmas=None,
+        schedule_preset: str | None = None,
         image: str | None = None,
         images=None,
         prompt_relay=None,
@@ -132,8 +142,18 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             width: Final video width.
             num_frames: Number of frames.
             seed: Random seed.
-            stage1_steps: Stage 1 steps (default: full DISTILLED_SIGMAS = 8).
-            stage2_steps: Stage 2 steps (default: full STAGE_2_SIGMAS = 3).
+            stage1_steps: Stage 1 steps. **Thins** the preset's table, keeping
+                its terminal 0.0 (it truncated before 2026-08-12, which left the
+                stage unfinished).
+            stage2_steps: Stage 2 steps, same semantics.
+            stage1_sigmas: Explicit stage-1 schedule, e.g.
+                ``[1.0, 0.975, 0.909375, 0.725, 0.421875, 0.0]``. Validated:
+                strictly decreasing, terminating at 0.0, at most the distilled
+                checkpoint's 9 points.
+            stage2_sigmas: Explicit stage-2 schedule, same validation.
+            schedule_preset: Named schedule for this lane —  ``"default"``,
+                ``"fast"`` or ``"vendor"`` on LTX-2.5. See
+                :func:`~ltx_pipelines_mlx.scheduler.resolve_distilled_schedule`.
             image: Optional reference image for I2V conditioning.
             **_unused_kwargs: Accepted (and ignored) for signature compatibility
                 with :meth:`TI2VidTwoStagesPipeline.generate_two_stage`. CFG / STG /
@@ -164,6 +184,22 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         assert self.dit is not None
         assert self.vae_encoder is not None
         assert self.upsampler is not None
+
+        # Both schedules are resolved here, before stage 1 spends a minute of
+        # GPU: an invalid schedule should fail at the door, not between stages.
+        sigmas_1, sigmas_2 = resolve_distilled_schedule(
+            model_version_of(self.dit),
+            preset=schedule_preset,
+            stage1_sigmas=stage1_sigmas,
+            stage2_sigmas=stage2_sigmas,
+            stage1_steps=stage1_steps,
+            stage2_steps=stage2_steps,
+        )
+        if self.verbose:
+            print(
+                f"  Schedule: stage 1 {len(sigmas_1) - 1} steps {sigmas_1} | "
+                f"stage 2 {len(sigmas_2) - 1} steps {sigmas_2}"
+            )
 
         # --- Stage 1: half resolution ---
         # Snap to the two-stage grid (multiples of 64) and report if it changed.
@@ -218,8 +254,6 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             initial_latent=None,
             legacy_scalar_blend=True,
         )
-
-        sigmas_1 = DISTILLED_SIGMAS[: stage1_steps + 1] if stage1_steps else DISTILLED_SIGMAS
 
         stage1_dit = self.dit
         if self._tile_count is not None:
@@ -282,9 +316,9 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
 
         # --- Stage 2: full resolution refine (no LoRA swap — already distilled) ---
         video_tokens, _ = self.video_patchifier.patchify(video_upscaled)
-        # LTX-2.5 moves stage 2's first sigma 0.909375 -> 0.85 (official
-        # template, node 395). 2.3 gets its own list, unchanged.
-        sigmas_2 = resolve_stage2_sigmas(model_version_of(self.dit), stage2_steps)
+        # ``sigmas_2`` was resolved before stage 1 (see above). Its first value
+        # is also the re-noising level: LTX-2.5 starts stage 2 at 0.85, so 15 %
+        # of stage 1 survives into the refine and 85 % is fresh noise.
         start_sigma = sigmas_2[0]
 
         video_positions_2 = compute_video_positions(F, H_full, W_full, frame_rate=frame_rate)

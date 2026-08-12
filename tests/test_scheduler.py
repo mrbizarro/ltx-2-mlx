@@ -76,17 +76,21 @@ class TestGetSigmaSchedule:
         sigmas = get_sigma_schedule("stage_2")
         assert sigmas == STAGE_2_SIGMAS
 
-    def test_truncate(self):
+    def test_thin(self):
+        """``num_steps`` thins the table; it sliced it until 2026-08-12, which
+        returned schedules that stopped mid-denoise (see
+        tests/test_distilled_schedule.py)."""
         sigmas = get_sigma_schedule("distilled", num_steps=4)
-        assert len(sigmas) == 4
-        assert sigmas == DISTILLED_SIGMAS[:4]
-
-    def test_truncate_1(self):
-        sigmas = get_sigma_schedule("distilled", num_steps=1)
-        assert len(sigmas) == 1
+        assert len(sigmas) == 5
         assert sigmas[0] == 1.0
+        assert sigmas[-1] == 0.0
+        assert all(s in DISTILLED_SIGMAS for s in sigmas)
 
-    def test_truncate_none_returns_full(self):
+    def test_thin_1(self):
+        sigmas = get_sigma_schedule("distilled", num_steps=1)
+        assert sigmas == [1.0, 0.0]
+
+    def test_thin_none_returns_full(self):
         sigmas = get_sigma_schedule("distilled", num_steps=None)
         assert sigmas == DISTILLED_SIGMAS
 
@@ -94,10 +98,10 @@ class TestGetSigmaSchedule:
         with pytest.raises(ValueError, match="Unknown schedule"):
             get_sigma_schedule("unknown_schedule")
 
-    def test_truncate_beyond_length(self):
-        """Truncating beyond the schedule length returns the full schedule."""
-        sigmas = get_sigma_schedule("distilled", num_steps=100)
-        assert sigmas == DISTILLED_SIGMAS
+    def test_more_steps_than_the_table_holds_raises(self):
+        """Padding a fixed distilled table is a guess, so it is refused."""
+        with pytest.raises(ValueError, match="cannot thin"):
+            get_sigma_schedule("distilled", num_steps=100)
 
 
 # ---------------------------------------------------------------------------
