@@ -108,7 +108,7 @@ packages/
 │       ├── retake.py                      # RetakePipeline: regenerate a time segment + extend (append/prepend)
 │       ├── keyframe_interpolation.py      # Keyframe interpolation
 │       ├── ic_lora.py                     # IC-LoRA reference-based generation
-│       ├── scheduler.py                   # DISTILLED_SIGMAS, STAGE_2_SIGMAS
+│       ├── scheduler.py                   # sigma tables, thinning, distilled presets
 │       ├── cli.py                         # CLI entry point
 │       └── utils/
 │           ├── samplers.py                # Sampling utilities (Euler denoising)
@@ -148,7 +148,7 @@ packages/
 - **Text encoder**: Gemma 3 12B → dual projections (video 4096-dim, audio 2048-dim) via Embeddings1DConnector
 - **Vocoder**: BigVGAN v2 with SnakeBeta activation (log-scale alpha/beta) + anti-aliased resampling
 - **BWE**: Residual bandwidth extension (base 16kHz → Hann-sinc 3× resample → causal MelSTFT → BWE generator → 48kHz)
-- **Distilled**: 8 steps (predefined sigma schedule), no classifier-free guidance
+- **Distilled**: 8 steps (predefined sigma schedule), no classifier-free guidance. LTX-2.5's distilled two-stage lane refines in 2 steps by default — see "Distilled schedule" below
 
 ### Key Shapes
 
@@ -513,6 +513,65 @@ ltx-2-mlx generate \
 ```
 
 Flags: `--two-stage` (Euler), `--two-stages-hq` (res_2s), `--cfg-scale` (default 3.0), `--stg-scale` (default 0.0), `--stage1-steps` (default 30 standard, 15 HQ), `--stage2-steps` (default 3), `--image`.
+
+### Distilled schedule — presets, explicit sigmas, and the terminal 0.0
+
+`generate --distilled` is the only lane whose schedule is a **fixed table**
+(`scheduler.DISTILLED_SIGMAS` + a per-generation stage-2 list) rather than a
+computed one. Both stages resolve through
+`scheduler.resolve_distilled_schedule(model_version, …)`, keyed on the
+checkpoint's generation.
+
+**NON-NEGOTIABLE: every schedule terminates at sigma 0.0.** Until 2026-08-12 a
+step count *sliced* the table (`DISTILLED_SIGMAS[: stage1_steps + 1]`), which
+drops the terminal zero — so `--stage2-steps 2` on LTX-2.5 ran
+`[0.85, 0.725, 0.421875]`, an **unfinished refine** that hands on a latent with
+residual noise while reporting itself as "2 steps". Every distilled call site in
+the package (distilled, ic-lora, lipdub, keyframe, a2v) now goes through
+`scheduler.thin_sigmas`, which keeps both endpoints and drops interior points at
+a uniform index stride, and **refuses** a count the table cannot supply rather
+than guessing. Pinned by `tests/test_distilled_schedule.py`, which walks every
+table × step count × preset × generation, plus a package-wide grep so the wart
+cannot come back through a fifth call site.
+
+| Generation | stage-1 default | stage-2 default | forwards |
+|---|---|---|---:|
+| LTX-2.5 | vendor 9 points | `0.85, 0.421875, 0.0` | 8 + 2 = **10** |
+| LTX-2.3 / unreadable version | vendor 9 points | `0.909375, 0.725, 0.421875, 0.0` | 8 + 3 = 11 |
+
+**LTX-2.5 presets** (`--schedule-preset`, from experiment 5, owner-adopted
+2026-08-12 — `notes/ltx25_perf_exp45.md` PART B):
+
+| Preset | steps | wall vs `vendor` | composition corr. | what it is |
+|---|---|---:|---:|---|
+| `default` | 8 + 2 | **−17.4 %** | **0.9988** | arm S2 — the same take, one fewer refine step |
+| `fast` | 5 + 2 | **−29.0 %** | 0.920 | arm F6S2 — **a different take**, for drafts |
+| `vendor` | 8 + 3 | — | 1.0 | the template's own lists (default before adoption) |
+
+2.3 offers `default` / `vendor` only, both its own vendor schedule; the thinned
+presets are **refused** there rather than remapped (experiment 5 never ran on a
+2.3 checkpoint). Adopting `default` **changes output** on 2.5 — 0.9988 is "the
+same take", not "the same file". Owner verdict, judgment 2: *"quality is fine"*.
+
+Three facts that explain the whole result, and are worth not re-deriving:
+
+- **Cost is linear and legible**: the distilled lane builds no guider, so it is
+  `(len(sigmas₁) − 1) + (len(sigmas₂) − 1)` forwards — one per step. Every point
+  removed is one forward removed.
+- **A stage-2 forward costs 4.6× a stage-1 forward** (29.6 s vs 6.40 s at
+  1024×576×121 q8) because stage 2 runs at full resolution. Stage 2 is the
+  cheapest place to thin.
+- **Stage 2 discards 85 % of stage 1 by construction.** Its first sigma is the
+  re-noising level (`noise·σ + stage1·(1−σ)`), and 2.5's is 0.85 — so only 15 %
+  of stage 1 survives. Stage 1's *tail* is therefore cheap to delete and its
+  *front* is not: the front decides the composition (removing it rerolls the
+  take), the tail is 85 % overwritten anyway.
+
+`--stage1-sigmas` / `--stage2-sigmas` accept an explicit comma-separated list,
+validated before any weight loads: ≥2 points, strictly decreasing, ≤1.0,
+terminating at 0.0, at most the checkpoint's 9 points. A list plus a step count
+for the same stage raises. Distilled-only — the dev lanes compute stage 1 from
+`ltx2_schedule` and their refine has not been graded thinned.
 
 ### Prompt Relay (`--segment`)
 

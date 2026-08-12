@@ -199,8 +199,12 @@ ltx-2-mlx generate   T2V / I2V / two-stage / HQ generation
   --two-stages-hq                Enable HQ pipeline (res_2s sampler)
   --cfg-scale         CFG guidance scale (default: 3.0)
   --stg-scale         STG guidance scale (default: 0.0)
-  --stage1-steps      Stage 1 steps (default: 30 standard, 15 HQ)
-  --stage2-steps      Stage 2 steps (default: 3)
+  --stage1-steps      Stage 1 steps (default: 30 standard, 15 HQ, 8 distilled)
+  --stage2-steps      Stage 2 steps (default: 3; 2 on --distilled with LTX-2.5)
+  --schedule-preset   --distilled only: default | fast | vendor (see below)
+  --stage1-sigmas     --distilled only: explicit stage-1 schedule, e.g.
+                      1.0,0.975,0.909375,0.725,0.421875,0.0
+  --stage2-sigmas     --distilled only: explicit stage-2 schedule
   --enhance-prompt    Enhance prompt with Gemma before generation
   --quiet, -q         Suppress progress output
 
@@ -263,6 +267,28 @@ ltx-2-mlx enhance    Prompt enhancement (no generation)
 
 ltx-2-mlx info       Model info and memory estimate
 ```
+
+### Distilled schedule presets (`--distilled`)
+
+The distilled lane runs a fixed sigma table, so its cost is exactly
+`(len(sigmas₁) − 1) + (len(sigmas₂) − 1)` DiT forwards — one per step, no
+guidance passes. On an LTX-2.5 checkpoint:
+
+| `--schedule-preset` | steps | wall vs `vendor` | output |
+|---|---|---:|---|
+| `default` | 8 + 2 | **−17 %** | same take, one fewer refine step |
+| `fast` | 5 + 2 | **−29 %** | **a different take** — drafts, not a cheaper copy |
+| `vendor` | 8 + 3 | — | the vendor template's lists |
+
+Measured at 1024×576×121, q8, n=1: 170.2 s → 140.7 s → 120.8 s. A stage-2 forward
+costs 4.6× a stage-1 one (it runs at full resolution), which is why `default`
+saves 17 % by dropping a single point.
+
+`--stage1-sigmas` / `--stage2-sigmas` take an explicit comma-separated schedule
+for anything the presets don't cover. Every schedule — preset, explicit, or
+thinned by `--stageN-steps` — must and does end at sigma **0.0**; a schedule that
+stops short leaves residual noise in the latent rather than "running fewer
+steps". Full detail in [docs/PIPELINES.md](docs/PIPELINES.md#the-distilled-lanes-sigma-schedule).
 
 ### Environment variables
 

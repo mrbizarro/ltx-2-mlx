@@ -17,7 +17,7 @@ by tier, see [PIPELINE_MATURITY.md](PIPELINE_MATURITY.md).
 | `generate --one-stage` | `TI2VidOneStagePipeline` | T2V / I2V | Euler + CFG (30 steps) at **full** resolution | — | q8 + dev LoRA | ✅ | 0.0 |
 | `generate --two-stage` | `TI2VidTwoStagesPipeline` | T2V / I2V | Euler + CFG (30 steps) | Euler distilled (3 steps) | q8 + dev LoRA | ✅ | 0.0 |
 | `generate --two-stages-hq` | `TI2VidTwoStagesHQPipeline` | T2V / I2V | res_2s + CFG (15 steps × 2 sub-steps) | Euler distilled (3) | q8 + dev LoRA | ✅ | 0.0 |
-| `generate --distilled` | `DistilledPipeline` | T2V / I2V | Euler distilled (8 steps) at half-res | Euler distilled (3) at full-res | q8 (distilled only) | ❌ | — |
+| `generate --distilled` | `DistilledPipeline` | T2V / I2V | Euler distilled (8 steps) at half-res | Euler distilled (**2** on LTX-2.5, 3 on 2.3) at full-res | q8 (distilled only) | ❌ | — |
 | `a2v` *(beta)* | `A2VidPipelineTwoStage` | A2V (+ optional I2V) | Euler + CFG (30) | Euler distilled (3) | q8 + dev LoRA | ✅ (audio cfg=7) | 0.0 |
 | `keyframe` | `KeyframeInterpolationPipeline` | start frame ↔ end frame | Euler + CFG (30) | Euler distilled (3) | q8 + dev LoRA | ✅ | 0.0 |
 | `ic-lora` | `ICLoraPipeline` | V2V (control video) + optional I2V | Euler distilled (8) | Euler distilled (3) | q8 + control LoRA | ❌ | — |
@@ -50,7 +50,7 @@ by tier, see [PIPELINE_MATURITY.md](PIPELINE_MATURITY.md).
 | `generate --one-stage` | `--frame-rate` (required), `--stage1-steps` aliased to `num_steps` (default 30), `--cfg-scale` (3.0), `--stg-scale` (0.0), `--image`. No stage2 / TeaCache / distilled-lora flags. Common: `--lora PATH STRENGTH` (incompatible with `--low-ram`), `--enhance-prompt`. |
 | `generate --two-stage` | `--frame-rate` (required), `--stage1-steps` (30), `--stage2-steps` (3), `--cfg-scale` (3.0), `--stg-scale` (0.0), `--image`, `--distilled-lora-strength` (1.0), `--enable-teacache`, `--teacache-thresh` |
 | `generate --two-stages-hq` | same as two-stage but stage1 default 15 steps, res_2s sampler |
-| `generate --distilled` | `--frame-rate` (required), `--stage1-steps` (8 default), `--stage2-steps` (3 default), `--image`. No CFG/STG/TeaCache flags (distilled flow). Same DiT in both stages — no LoRA swap. |
+| `generate --distilled` | `--frame-rate` (required), `--stage1-steps` (8 default), `--stage2-steps` (**2 default on LTX-2.5**, 3 on 2.3), `--schedule-preset {default,fast,vendor}`, `--stage1-sigmas` / `--stage2-sigmas` (explicit comma-separated schedules), `--image`. No CFG/STG/TeaCache flags (distilled flow). Same DiT in both stages — no LoRA swap. A step count **thins** the schedule keeping its terminal 0.0; it truncated (leaving an unfinished denoise) before 2026-08-12. See [the distilled schedule](#the-distilled-lanes-sigma-schedule). |
 | `a2v` | `--audio` (required), `--image`, `--audio-start`, `--frame-rate` (required), all two-stage flags |
 | `keyframe` | `--start` / `--end` (image paths, required), `--frame-rate` (required), all two-stage flags |
 | `ic-lora` | `--frame-rate` (required), `--lora PATH STRENGTH` (required, repeatable), `--video-conditioning PATH STRENGTH` (required, repeatable), `--conditioning-strength` (1.0), `--image`, `--skip-stage-2`, `--stage1-steps`, `--stage2-steps` |
@@ -70,3 +70,65 @@ by tier, see [PIPELINE_MATURITY.md](PIPELINE_MATURITY.md).
 - `generate` requires a mode flag (`--one-stage`, `--two-stage`, `--two-stages-hq`, or `--distilled`). There is **no implicit default** — every pipeline maps 1:1 to an upstream Lightricks/LTX-2 class.
 - `generate --one-stage` vs `generate --two-stage`: same dev model + CFG, but `--one-stage` runs **once at the target resolution** (no upscaler dependency, simpler latents for downstream). `--two-stage` runs at half-res then upscales 2× and refines (typically faster overall and better at large targets). Pick `--one-stage` for native res ≤ 480×704 or if you don't trust the upsampler; pick `--two-stage` for everything else.
 - `generate --distilled` vs `generate --two-stage`: same half-res + upscale structure, but `--distilled` skips CFG entirely (8 stage 1 steps × 1 forward instead of 30 × 2-4). Fastest mode; quality slightly below the dev+CFG variants.
+
+## The distilled lane's sigma schedule
+
+`generate --distilled` is the only lane whose schedule is a **fixed table** rather
+than a computed one, so it is the only lane where "how many steps" and "which
+sigmas" are separate questions. Both stages resolve through
+`scheduler.resolve_distilled_schedule`, keyed on the checkpoint's generation.
+
+**Every schedule this lane can produce terminates at sigma 0.0.** Before
+2026-08-12 a step count *sliced* the table, so `--stage2-steps 2` on LTX-2.5 ran
+`[0.85, 0.725, 0.421875]` — an unfinished refine that hands on a latent with
+residual noise while reporting itself as "2 steps". A step count now **thins**
+the table (both endpoints kept, interior points dropped at a uniform stride) and
+a count the table cannot supply is refused with a message.
+
+### Defaults, per checkpoint generation
+
+| Generation | stage 1 | stage 2 | forwards |
+|---|---|---|---:|
+| LTX-2.5 | the vendor's 9 points | `0.85, 0.421875, 0.0` | 8 + 2 = **10** |
+| LTX-2.3 (and any unreadable version) | the vendor's 9 points | `0.909375, 0.725, 0.421875, 0.0` | 8 + 3 = 11 |
+
+The distilled lane costs exactly `(len(sigmas₁) − 1) + (len(sigmas₂) − 1)` DiT
+forwards — no guider, no substep, one forward per step — so every sigma point
+removed is one forward removed.
+
+### `--schedule-preset` (LTX-2.5)
+
+| Preset | Schedule | Wall vs `vendor` | What it does to the output |
+|---|---|---:|---|
+| `default` | 8 + 2 | **−17 %** | Same take (composition correlation 0.9988), one fewer refine step |
+| `fast` | 5 + 2 | **−29 %** | **A different take** (0.920) — a coherent shot, not a cheaper copy of the same one. Drafts and take exploration |
+| `vendor` | 8 + 3 | — | The vendor template's own lists; this lane's default before 2026-08-12 |
+
+On LTX-2.3 only `default` / `vendor` exist, both the 2.3 vendor schedule. The
+thinned presets were graded on the 2.5 distilled checkpoint and are refused
+elsewhere rather than silently remapped.
+
+Measured at 1024×576×121, q8, seed 774411, n=1: vendor **170.2 s**, default
+**140.7 s**, fast **120.8 s**. A stage-2 forward costs **4.6×** a stage-1 forward
+on this lane (29.6 s vs 6.40 s), because stage 2 runs at full resolution — which
+is why stage 2 is the cheapest place to thin.
+
+### `--stage1-sigmas` / `--stage2-sigmas`
+
+Explicit comma-separated schedules, for anything the presets do not cover:
+
+```bash
+ltx-2-mlx generate --distilled -p "..." --frame-rate 24 \
+  --stage1-sigmas 1.0,0.99375,0.9875,0.98125,0.975,0.0 \
+  --stage2-sigmas 0.85,0.421875,0.0 -o out.mp4
+```
+
+Validated before anything loads: at least 2 points, strictly decreasing, starting
+at or below 1.0, terminating at 0.0, and at most the distilled checkpoint's 9
+points. A list and a step count for the same stage is a contradiction and raises.
+
+**Stage 2's first sigma is not just a starting point** — it is the level the
+upscaled latent is re-noised to (`noise·σ + stage1·(1−σ)`). At LTX-2.5's 0.85
+only **15 %** of stage 1 survives into the refine, which is why stage 1's tail is
+cheap to thin and its front is not: the front decides the composition, the tail
+is 85 % overwritten. Moving that first value changes far more than one step.
