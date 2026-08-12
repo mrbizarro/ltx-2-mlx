@@ -71,6 +71,43 @@ def _compute_per_token_timesteps(
     return (denoise_mask * sigma).squeeze(-1)
 
 
+def _stepper_schedule(sigmas: list[float], diffusion_step) -> mx.array | None:
+    """Materialise the sigma schedule once, for steppers that index into it.
+
+    ``EulerAncestralDiffusionStep.step`` takes the *whole* schedule plus a step
+    index (it needs both endpoints and the terminal zero), where ``euler_step``
+    takes two scalars. Building the array once per loop rather than once per
+    step keeps the ancestral path from paying for the interface difference.
+    Returns ``None`` when no stepper is in play, so the Euler path allocates
+    nothing at all.
+    """
+    if diffusion_step is None:
+        return None
+    return mx.array(sigmas, dtype=mx.float32)
+
+
+def _ancestral_step(
+    diffusion_step,
+    x: mx.array,
+    x0: mx.array,
+    sigma_schedule: mx.array,
+    step_index: int,
+) -> mx.array:
+    """One ancestral step, with the renoise term's noise drawn per call.
+
+    The noise is drawn from MLX's global RNG, which the pipelines seed once per
+    run — so an ancestral render is exactly as reproducible as a Euler one at
+    the same seed, and A/B arms at one seed differ only by the sampler.
+
+    Video and audio get INDEPENDENT noise, drawn in that order. They are
+    separate latent spaces with separate schedules; sharing a draw would
+    correlate the two modalities' stochastic components for no reason and
+    would not even be shape-compatible.
+    """
+    noise = mx.random.normal(x.shape, dtype=mx.float32)
+    return diffusion_step.step(x, x0, sigma_schedule, step_index, noise=noise)
+
+
 def denoise_loop(
     model: X0Model,
     video_state: LatentState,
@@ -84,6 +121,7 @@ def denoise_loop(
     audio_attention_mask: mx.array | None = None,
     video_cross_attention_mask: mx.array | None = None,
     show_progress: bool = True,
+    diffusion_step=None,
 ) -> DenoiseOutput:
     """Run the Euler denoising loop for joint audio+video.
 
@@ -101,6 +139,13 @@ def denoise_loop(
         video_attention_mask: Attention mask for video.
         audio_attention_mask: Attention mask for audio.
         show_progress: Whether to show tqdm progress bar.
+        diffusion_step: Optional stepper object with a
+            ``step(sample, denoised, sigmas, step_index, noise=...)`` method —
+            in practice ``EulerAncestralDiffusionStep``, which LTX-2.5 expects
+            (see ``utils.sampler_choice``). **``None`` keeps the plain Euler
+            update, byte for byte.** That is deliberate: LTX-2.3 must not
+            change, and the cheapest guarantee is that its code path does not
+            move.
 
     Returns:
         DenoiseOutput with final video and audio latents.
@@ -132,7 +177,9 @@ def denoise_loop(
     video_uniform = _is_uniform_mask(video_state.denoise_mask)
     audio_uniform = _is_uniform_mask(audio_state.denoise_mask)
 
-    for sigma, sigma_next in iterator:
+    sigma_schedule = _stepper_schedule(sigmas, diffusion_step)
+
+    for step_index, (sigma, sigma_next) in enumerate(iterator):
         # Build sigma / per-token timesteps
         sigma_arr = mx.array([sigma], dtype=mx.bfloat16)
         B = video_x.shape[0]
@@ -164,9 +211,13 @@ def denoise_loop(
         video_x0 = apply_denoise_mask(video_x0, video_state.clean_latent, video_state.denoise_mask)
         audio_x0 = apply_denoise_mask(audio_x0, audio_state.clean_latent, audio_state.denoise_mask)
 
-        # Euler step
-        video_x = euler_step(video_x, video_x0, sigma, sigma_next)
-        audio_x = euler_step(audio_x, audio_x0, sigma, sigma_next)
+        # Euler step, or the ancestral (SDE) step when the checkpoint asks for it
+        if diffusion_step is None:
+            video_x = euler_step(video_x, video_x0, sigma, sigma_next)
+            audio_x = euler_step(audio_x, audio_x0, sigma, sigma_next)
+        else:
+            video_x = _ancestral_step(diffusion_step, video_x, video_x0, sigma_schedule, step_index)
+            audio_x = _ancestral_step(diffusion_step, audio_x, audio_x0, sigma_schedule, step_index)
 
         # Force computation for memory efficiency
         mx.async_eval(video_x, audio_x)
@@ -610,6 +661,7 @@ def guided_denoise_loop(
     show_progress: bool = True,
     tap: callable | None = None,
     teacache=None,  # mlx_arsenal.diffusion.TeaCacheController-compatible
+    diffusion_step=None,
 ) -> DenoiseOutput:
     """Run the Euler denoising loop with multi-modal guidance (CFG/STG).
 
@@ -695,6 +747,8 @@ def guided_denoise_loop(
     last_video_x0: mx.array | None = None
     last_audio_x0: mx.array | None = None
 
+    sigma_schedule = _stepper_schedule(sigmas, diffusion_step)
+
     for step_idx, (sigma, sigma_next) in enumerate(iterator):
         # Build guiders for this sigma level
         video_guider = video_guider_factory.build_from_sigma(sigma)
@@ -707,8 +761,12 @@ def guided_denoise_loop(
             and last_video_x0 is not None
             and last_audio_x0 is not None
         ):
-            video_x = euler_step(video_x, last_video_x0, sigma, sigma_next)
-            audio_x = euler_step(audio_x, last_audio_x0, sigma, sigma_next)
+            if diffusion_step is None:
+                video_x = euler_step(video_x, last_video_x0, sigma, sigma_next)
+                audio_x = euler_step(audio_x, last_audio_x0, sigma, sigma_next)
+            else:
+                video_x = _ancestral_step(diffusion_step, video_x, last_video_x0, sigma_schedule, step_idx)
+                audio_x = _ancestral_step(diffusion_step, audio_x, last_audio_x0, sigma_schedule, step_idx)
             mx.async_eval(video_x, audio_x)
             continue
 
@@ -891,9 +949,13 @@ def guided_denoise_loop(
         last_video_x0 = video_x0
         last_audio_x0 = audio_x0
 
-        # Euler step
-        video_x = euler_step(video_x, video_x0, sigma, sigma_next)
-        audio_x = euler_step(audio_x, audio_x0, sigma, sigma_next)
+        # Euler step, or the ancestral (SDE) step when the checkpoint asks for it
+        if diffusion_step is None:
+            video_x = euler_step(video_x, video_x0, sigma, sigma_next)
+            audio_x = euler_step(audio_x, audio_x0, sigma, sigma_next)
+        else:
+            video_x = _ancestral_step(diffusion_step, video_x, video_x0, sigma_schedule, step_idx)
+            audio_x = _ancestral_step(diffusion_step, audio_x, audio_x0, sigma_schedule, step_idx)
 
         # Force computation for memory efficiency
         mx.async_eval(video_x, audio_x)

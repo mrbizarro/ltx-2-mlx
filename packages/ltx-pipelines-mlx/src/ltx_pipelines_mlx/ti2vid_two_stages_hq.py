@@ -26,6 +26,7 @@ from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_
 from ltx_pipelines_mlx.scheduler import STAGE_2_SIGMAS, ltx2_schedule
 from ltx_pipelines_mlx.ti2vid_two_stages import DEFAULT_CFG_SCALE, TI2VidTwoStagesPipeline
 from ltx_pipelines_mlx.utils.helpers import create_noised_state
+from ltx_pipelines_mlx.utils.sampler_choice import resolve_diffusion_step
 from ltx_pipelines_mlx.utils.samplers import denoise_loop, res2s_denoise_loop
 
 # TeaCache calibration constants for the HQ res_2s path (LTX-2 stage 1, 30
@@ -321,6 +322,9 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
             audio_text_embeds=audio_embeds,
             sigmas=sigmas_2,
             video_cross_attention_mask=relay_mask(F, H_full, W_full, video_state_2.latent.shape[1]),
+            # Stage 1 above is res_2s (its own stochastic sampler, untouched);
+            # this refine pass is the Euler one the 2.5 templates replace.
+            diffusion_step=resolve_diffusion_step(self.dit),
         )
         if self.low_memory:
             aggressive_cleanup()

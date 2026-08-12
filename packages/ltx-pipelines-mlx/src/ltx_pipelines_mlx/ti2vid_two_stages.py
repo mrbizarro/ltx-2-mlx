@@ -35,6 +35,7 @@ from ltx_core_mlx.utils.weights import load_split_safetensors
 from ltx_pipelines_mlx._base import BasePipeline
 from ltx_pipelines_mlx.scheduler import STAGE_2_SIGMAS, ltx2_schedule
 from ltx_pipelines_mlx.utils.helpers import create_noised_state
+from ltx_pipelines_mlx.utils.sampler_choice import resolve_diffusion_step
 from ltx_pipelines_mlx.utils.samplers import denoise_loop, guided_denoise_loop
 
 # Reference defaults
@@ -488,6 +489,7 @@ class TI2VidTwoStagesPipeline(BasePipeline):
             video_cross_attention_mask=relay_mask(F, H_half, W_half, video_state.latent.shape[1]),
             teacache=teacache_controller,
             tap=tap,
+            diffusion_step=resolve_diffusion_step(self.dit),
         )
         if self.low_memory:
             aggressive_cleanup()
@@ -588,6 +590,7 @@ class TI2VidTwoStagesPipeline(BasePipeline):
             audio_text_embeds=audio_embeds,
             sigmas=sigmas_2,
             video_cross_attention_mask=relay_mask(F, H_full, W_full, video_state_2.latent.shape[1]),
+            diffusion_step=resolve_diffusion_step(self.dit),
         )
         if self.low_memory:
             aggressive_cleanup()

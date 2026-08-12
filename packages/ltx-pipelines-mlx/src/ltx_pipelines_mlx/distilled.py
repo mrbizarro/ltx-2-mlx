@@ -39,6 +39,7 @@ from .scheduler import DISTILLED_SIGMAS, STAGE_2_SIGMAS
 from .ti2vid_two_stages import TI2VidTwoStagesPipeline
 from .utils.helpers import create_noised_state
 from .utils.progress import phase
+from .utils.sampler_choice import resolve_diffusion_step
 from .utils.samplers import denoise_loop
 
 _materialize = getattr(mx, "eval")  # noqa: B009 -- security hook flags mx.eval pattern
@@ -238,6 +239,8 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             audio_text_embeds=audio_embeds,
             sigmas=sigmas_1,
             video_cross_attention_mask=relay_mask(F, H_half, W_half, video_state.latent.shape[1]),
+            # LTX-2.5 samples stage 1 ancestrally; 2.3 gets None -> plain Euler.
+            diffusion_step=resolve_diffusion_step(self.dit),
         )
         if self.low_memory:
             aggressive_cleanup()
@@ -322,6 +325,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             audio_text_embeds=audio_embeds,
             sigmas=sigmas_2,
             video_cross_attention_mask=relay_mask(F, H_full, W_full, video_state_2.latent.shape[1]),
+            diffusion_step=resolve_diffusion_step(self.dit),
         )
         if self.low_memory:
             aggressive_cleanup()

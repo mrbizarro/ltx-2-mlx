@@ -383,7 +383,14 @@ class KeyframeInterpolationPipeline(TI2VidTwoStagesPipeline):
             initial_latent=audio_tokens_1,
         )
 
-        # Stage 2 denoising: simple (no CFG), matching reference
+        # Stage 2 denoising: simple (no CFG), matching reference.
+        #
+        # NO `diffusion_step=` here, on purpose, and it is not an oversight —
+        # this pipeline is flf2v, and the official LTX-2.5 flf2v template is the
+        # one template of the three that pins the ancestral sampler's eta to 0,
+        # where it is arithmetically the Euler step. t2v/i2v get eta 1.0; a run
+        # bounded by two given frames gets none. See utils/sampler_choice.py
+        # (KEYFRAME_ETA) and tests/test_ltx25_sampler_wiring.py.
         self._pre_denoise_flush(video_state_2, audio_state_2)
         output_2 = denoise_loop(
             model=x0_model,
