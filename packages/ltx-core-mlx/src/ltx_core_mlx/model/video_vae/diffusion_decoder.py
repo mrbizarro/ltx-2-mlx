@@ -409,7 +409,9 @@ class NADiffusionDecoder(nn.Module):
             for i in range(len(stage_channels) - 1)
         ]
         self.upsamples = [
-            LinearPixelShuffleUpsample(stage_channels[i], upsamples[i][0], out_channels_reduction_factor=upsamples[i][1])
+            LinearPixelShuffleUpsample(
+                stage_channels[i], upsamples[i][0], out_channels_reduction_factor=upsamples[i][1]
+            )
             for i in range(len(stage_channels) - 1)
         ]
         self.t_embedder = TimestepEmbedder(t_emb_dim=t_emb_dim)
@@ -530,16 +532,17 @@ class DiffusionVideoDecoder(nn.Module):
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__()
         cfg = dict(LTX_25_DIFFUSION_VAE_CONFIG if config is None else config)
+        defaults = LTX_25_DIFFUSION_VAE_CONFIG
         self.decoder = NADiffusionDecoder(
             in_channels=cfg.get("in_channels", 128),
             out_channels=cfg.get("out_channels", 3),
             patch_size=cfg.get("patch_size", 4),
             head_dim=cfg.get("head_dim", 64),
-            stage_channels=tuple(cfg.get("stage_channels", (2048, 1024, 512, 512, 256))),
-            stage_depths=tuple(cfg.get("stage_depths", (4, 6, 4, 2, 8))),
-            stage_kernels=tuple(tuple(k) for k in cfg.get("stage_kernels", ((3, 7, 7),) * 2 + ((3, 5, 5),) * 2 + ((11, 11, 11),))),
-            upsamples=tuple((tuple(s), r) for s, r in cfg.get("upsamples", (((1, 2, 2), 2), ((2, 1, 1), 2), ((2, 2, 2), 1), ((2, 2, 2), 2)))),
-            stage5_kernel=tuple(cfg.get("stage5_kernel", (11, 11, 11))),
+            stage_channels=tuple(cfg.get("stage_channels", defaults["stage_channels"])),
+            stage_depths=tuple(cfg.get("stage_depths", defaults["stage_depths"])),
+            stage_kernels=tuple(tuple(k) for k in cfg.get("stage_kernels", defaults["stage_kernels"])),
+            upsamples=tuple((tuple(s), r) for s, r in cfg.get("upsamples", defaults["upsamples"])),
+            stage5_kernel=tuple(cfg.get("stage5_kernel", defaults["stage5_kernel"])),
             t_emb_dim=cfg.get("t_emb_dim", 384),
             default_num_inference_steps=cfg.get("default_num_inference_steps", 1),
             timestep_scale_multiplier=cfg.get("timestep_scale_multiplier", 1000.0),
@@ -565,16 +568,27 @@ class DiffusionVideoDecoder(nn.Module):
 
     # -- memory planning ----------------------------------------------------
 
+    #: Multiple of one stage-5 tensor that peak memory actually reaches. Counted by
+    #: hand you get ~6 (context, x, Q, K, V, out); **measured** on an M4 Max it is 15.
+    #: The gap is MLX holding freed-but-cached buffers plus the NA gather's stacked K/V
+    #: and the det-stage intermediates that are still resident. Calibrated against a
+    #: real untiled decode: 768x448x121 (16 latent frames) peaks at 21.05 GiB, i.e.
+    #: 1.32 GiB per latent frame, against 0.53 GiB predicted by the hand count. Using
+    #: the hand count would make ``LTX2_DIFFVAE_BUDGET_GB`` mean nothing.
+    PEAK_TENSOR_MULTIPLE = 15
+
     def stage5_bytes_per_latent_frame(self, h_lat: int, w_lat: int, itemsize: int = 2) -> int:
-        """Rough peak-driver: the stage-5 tensors scale linearly in latent frames.
+        """Peak driver: the stage-5 tensors scale linearly in latent frames.
 
         Per latent frame the stage-5 grid is ``temporal_upscale`` frames of
-        ``(H_lat*8, W_lat*8)`` tokens at 256 channels. Counted live at once: context,
-        x, and Q/K/V -- five such tensors, plus a margin for the NA score blocks.
+        ``(H_lat*8, W_lat*8)`` tokens at 256 channels.
+
+        On top of this sits a per-clip fixed cost the tiling cannot reduce: the shared
+        noise volume and the fp32 blend accumulator, together ~0.75 GiB at 768x448x121.
         """
         c5 = self.decoder.context_channels
         tokens = self.temporal_upscale * (h_lat * self.spatial_upscale // 4) * (w_lat * self.spatial_upscale // 4)
-        return int(tokens * c5 * itemsize * 6)
+        return int(tokens * c5 * itemsize * self.PEAK_TENSOR_MULTIPLE)
 
     def plan_temporal_tiles(self, f_lat: int, h_lat: int, w_lat: int) -> list[tuple[int, int]]:
         """``[(t0, t1), ...]`` latent slices, overlapping, covering ``[0, f_lat)``."""
