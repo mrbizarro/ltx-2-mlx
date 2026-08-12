@@ -812,6 +812,23 @@ anything. No mp4, wav or frames directory is left behind; the abort lands during
 before any encode. A sentinel already present at start-up is treated as stale and deleted
 (`stale_abort_cleared: true`).
 
+### Measured (2026-08-12, MLX 0.31.1, M4 Max)
+
+- **Lossless on both call sites.** Video elementary stream, decoded audio and container
+  `sha256` identical off vs on, for `denoise_loop` (q8 distilled draft) and for
+  `res2s_denoise_loop` (`--two-stages-hq`, dev + fused distilled LoRA).
+- **0.22 % of wall at the High tier** — 0.674 s over 24 previews on a 305 s render; 0.60 % at
+  the draft tier. Peak memory +0.23 GB RSS, i.e. inside the noise.
+- **Context 2 is indistinguishable from decoding the whole clip** (0.42/255, correlation
+  0.99999) at 27 ms. Context 0 is visibly ghosted. `context >= latent_frame` is bit-exact.
+- **The composition is settled at estimate 2 of 24** on the HQ path (correlation 0.962, 53.7 s
+  into a 305 s render). On the **distilled** path it is estimate **6 of 8** — `DISTILLED_SIGMAS`
+  puts five of its nine points at >= 0.975, so the early thumbnails are still noise.
+- **On the HQ path, prefer `--live-preview-every 2`.** res_2s's odd (anchor) estimates are
+  evaluated just after step-level SDE noise injection and come back visibly patchier than its
+  even (substep) ones until ~estimate 8. `forward % 2 == 0` selects exactly the substeps, so the
+  picture stops flickering and the cost halves.
+
 ### Honest limits
 
 - **It is a composition monitor, not a face monitor.** The tiny decoder is soft by design and
