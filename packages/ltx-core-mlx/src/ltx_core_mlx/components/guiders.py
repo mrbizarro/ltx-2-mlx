@@ -56,6 +56,29 @@ class MultiModalGuiderParams:
     skip_step: int = 0
     """Skip step controlling how often the model skips the guidance step."""
 
+    def __post_init__(self) -> None:
+        """Neutralise an STG scale that has no blocks to perturb.
+
+        ``stg_blocks=[]`` means *no block is perturbed* (``Perturbation``
+        treats ``None`` as "all blocks" and a list as an allow-list, so
+        ``block in []`` is always False). A perturbed pass built from an empty
+        block list therefore computes **exactly** the conditioned prediction,
+        and the guider adds ``stg_scale * (cond - cond) == 0``: a whole extra
+        DiT forward per prediction whose contribution is identically zero.
+
+        On the HQ two-stage path that is 25 % of stage 1. It is reachable
+        today because ``TI2VidTwoStagesHQPipeline`` never overrides
+        ``generate_and_save``, whose inherited signature defaults
+        ``stg_scale=1.0`` — correct for the Euler path, which pairs it with
+        ``stg_blocks=[28]``, and wrong for HQ, which pairs it with ``[]``.
+
+        Folding the scale to 0.0 here is **output-invariant by construction**:
+        the term it removes was already exactly zero. ``stg_blocks=None``
+        (= all blocks) is deliberately untouched.
+        """
+        if self.stg_blocks is not None and len(self.stg_blocks) == 0 and self.stg_scale != 0.0:
+            object.__setattr__(self, "stg_scale", 0.0)
+
 
 def _params_for_sigma_from_sorted_dict(
     sigma: float,

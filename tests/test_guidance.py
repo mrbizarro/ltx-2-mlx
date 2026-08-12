@@ -212,3 +212,34 @@ class TestBatchedPerturbationConfig:
         values = mx.zeros((3, 10))
         mask = batch.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, block=0, values=values)
         assert mask.shape == (3, 1)
+
+
+# --- STG with no blocks is a no-op pass (Experiment 1, 2026-08-12) -----------
+
+
+def test_empty_stg_blocks_folds_the_scale_to_zero():
+    """``stg_blocks=[]`` perturbs nothing, so the STG pass contributes exactly 0.
+
+    Measured: the HQ two-stage path ran a fourth DiT forward per prediction --
+    25 % of stage 1 -- whose guider term was identically zero, because
+    ``generate_and_save`` inherits the Euler default ``stg_scale=1.0`` while
+    the HQ pipeline pairs it with an empty block list.
+    """
+    from ltx_core_mlx.components.guiders import MultiModalGuider, MultiModalGuiderParams
+
+    p = MultiModalGuiderParams(cfg_scale=3.0, stg_scale=1.0, stg_blocks=[], rescale_scale=0.45)
+    assert p.stg_scale == 0.0, "an STG scale with no blocks to perturb must fold to 0.0"
+
+    guider = MultiModalGuider(params=p)
+    assert not guider.do_perturbed_generation(), "the perturbed pass must not be scheduled"
+
+
+def test_real_stg_blocks_are_left_alone():
+    """The Euler path's ``stg_blocks=[28]`` is a real perturbation -- never folded."""
+    from ltx_core_mlx.components.guiders import MultiModalGuiderParams
+
+    p = MultiModalGuiderParams(cfg_scale=3.0, stg_scale=1.0, stg_blocks=[28])
+    assert p.stg_scale == 1.0
+
+    all_blocks = MultiModalGuiderParams(cfg_scale=3.0, stg_scale=1.0, stg_blocks=None)
+    assert all_blocks.stg_scale == 1.0, "stg_blocks=None means ALL blocks, not none"
