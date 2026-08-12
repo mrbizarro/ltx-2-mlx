@@ -47,6 +47,28 @@ class DenoiseOutput:
     audio_latent: mx.array  # (B, N_audio, C)
 
 
+def euler_loop_estimates(sigmas: list[float]) -> int:
+    """x0 estimates :func:`denoise_loop` / :func:`guided_denoise_loop` will produce.
+
+    One per consecutive sigma pair. Used by the live preview to know the total up front so
+    its ETA is right from the first thumbnail instead of climbing as the loop runs.
+    """
+    return max(0, len(sigmas) - 1)
+
+
+def res2s_loop_estimates(sigmas: list[float]) -> int:
+    """x0 estimates :func:`res2s_denoise_loop` will produce.
+
+    res_2s is a second-order integrator: **two** ``_predict`` calls per outer step (the
+    anchor and the substep), plus one terminal ``_predict`` when the schedule ends at 0.0.
+    Note this counts *estimates*, not DiT forwards — with CFG on, each estimate is two DiT
+    passes, which is the distinction the LTX-2.5 brief insists on measuring rather than
+    deriving.
+    """
+    n_full_steps = max(0, len(sigmas) - 1)
+    return 2 * n_full_steps + (1 if sigmas and sigmas[-1] == 0 else 0)
+
+
 def _is_uniform_mask(mask: mx.array) -> bool:
     """Check if denoise mask is all-ones (full denoise, no conditioning)."""
     return bool(mx.all(mask == 1.0).item())
@@ -122,6 +144,7 @@ def denoise_loop(
     video_cross_attention_mask: mx.array | None = None,
     show_progress: bool = True,
     diffusion_step=None,
+    preview=None,
 ) -> DenoiseOutput:
     """Run the Euler denoising loop for joint audio+video.
 
@@ -146,6 +169,12 @@ def denoise_loop(
             update, byte for byte.** That is deliberate: LTX-2.3 must not
             change, and the cheapest guarantee is that its code path does not
             move.
+        preview: Optional ``LivePreviewMonitor``. **Read-only**: it is handed the
+            masked x0 estimate this loop already computed and publishes a
+            thumbnail from it. It draws no random numbers and writes no tensor,
+            so a render with it on is byte-identical to one with it off. It also
+            raises ``LivePreviewAborted`` between steps when the ABORT sentinel
+            appears.
 
     Returns:
         DenoiseOutput with final video and audio latents.
@@ -180,6 +209,9 @@ def denoise_loop(
     sigma_schedule = _stepper_schedule(sigmas, diffusion_step)
 
     for step_index, (sigma, sigma_next) in enumerate(iterator):
+        if preview is not None:
+            preview.check_abort(f"before step {step_index + 1}/{len(steps)}")
+
         # Build sigma / per-token timesteps
         sigma_arr = mx.array([sigma], dtype=mx.bfloat16)
         B = video_x.shape[0]
@@ -211,6 +243,9 @@ def denoise_loop(
         video_x0 = apply_denoise_mask(video_x0, video_state.clean_latent, video_state.denoise_mask)
         audio_x0 = apply_denoise_mask(audio_x0, audio_state.clean_latent, audio_state.denoise_mask)
 
+        if preview is not None:
+            preview.publish(video_x0, sigma)
+
         # Euler step, or the ancestral (SDE) step when the checkpoint asks for it
         if diffusion_step is None:
             video_x = euler_step(video_x, video_x0, sigma, sigma_next)
@@ -221,6 +256,9 @@ def denoise_loop(
 
         # Force computation for memory efficiency
         mx.async_eval(video_x, audio_x)
+
+    if preview is not None:
+        preview.check_abort("after the last step")
 
     aggressive_cleanup()
 
@@ -312,6 +350,7 @@ def res2s_denoise_loop(
     audio_guider_factory: MultiModalGuiderFactory | None = None,
     tap: callable | None = None,
     teacache=None,
+    preview=None,
 ) -> DenoiseOutput:
     """Run the res_2s second-order denoising loop for joint audio+video.
 
@@ -343,6 +382,11 @@ def res2s_denoise_loop(
         show_progress: Whether to show tqdm progress bar.
         bongmath: Enable iterative anchor refinement for small steps.
         bongmath_max_iter: Max iterations for bong refinement.
+        preview: Optional ``LivePreviewMonitor``. Publishes **both** of the
+            step's x0 estimates (the anchor evaluation at ``sigma`` and the
+            substep evaluation at ``sub_sigma``) plus the terminal one, because
+            each is a picture the loop already holds. Read-only; see
+            :func:`denoise_loop`.
 
     Returns:
         DenoiseOutput with final video and audio latents.
@@ -512,6 +556,9 @@ def res2s_denoise_loop(
     iterator = tqdm(range(n_full_steps), desc=desc, disable=not show_progress)
 
     for step_idx in iterator:
+        if preview is not None:
+            preview.check_abort(f"before step {step_idx + 1}/{n_full_steps}")
+
         sigma = sigmas[step_idx]
         sigma_next = sigmas[step_idx + 1]
         h = hs[step_idx]
@@ -575,6 +622,9 @@ def res2s_denoise_loop(
             v_res, a_res = captured_residuals["stage1"]["cond"]
             tap(step_idx, gate_signal, v_res, a_res)
 
+        if preview is not None:
+            preview.publish(denoised_v1, sigma)
+
         a21, b1, b2 = get_res2s_coefficients(h, phi_cache, c2)
 
         # Substep sigma: geometric mean (exact for c2=0.5)
@@ -609,6 +659,9 @@ def res2s_denoise_loop(
         if teacache is not None and should_compute_full:
             teacache.cache_residual(captured_residuals)
 
+        if preview is not None:
+            preview.publish(denoised_v2, sub_sigma)
+
         eps_2_v = denoised_v2 - x_anchor_v
         eps_2_a = denoised_a2 - x_anchor_a
 
@@ -629,10 +682,17 @@ def res2s_denoise_loop(
     # TeaCache is bypassed for this terminal step — it's a one-shot denoise
     # outside the controller's num_steps range.
     if sigmas[-1] == 0:
+        if preview is not None:
+            preview.check_abort("before the terminal denoise")
         video_x0, audio_x0 = _predict(video_x, audio_x, sigmas[n_full_steps])
         video_x = video_x0
         audio_x = audio_x0
+        if preview is not None:
+            preview.publish(video_x0, sigmas[n_full_steps])
         mx.async_eval(video_x, audio_x)
+
+    if preview is not None:
+        preview.check_abort("after the last step")
 
     aggressive_cleanup()
     return DenoiseOutput(
@@ -662,6 +722,7 @@ def guided_denoise_loop(
     tap: callable | None = None,
     teacache=None,  # mlx_arsenal.diffusion.TeaCacheController-compatible
     diffusion_step=None,
+    preview=None,
 ) -> DenoiseOutput:
     """Run the Euler denoising loop with multi-modal guidance (CFG/STG).
 
@@ -705,6 +766,8 @@ def guided_denoise_loop(
             previous step's cached residuals replace the block stack via
             ``block_stack_override``. The transformer head still runs
             on every pass.
+        preview: Optional ``LivePreviewMonitor``; read-only, see
+            :func:`denoise_loop`.
 
     Returns:
         DenoiseOutput with final video and audio latents.
@@ -750,6 +813,9 @@ def guided_denoise_loop(
     sigma_schedule = _stepper_schedule(sigmas, diffusion_step)
 
     for step_idx, (sigma, sigma_next) in enumerate(iterator):
+        if preview is not None:
+            preview.check_abort(f"before step {step_idx + 1}/{len(steps)}")
+
         # Build guiders for this sigma level
         video_guider = video_guider_factory.build_from_sigma(sigma)
         audio_guider = audio_guider_factory.build_from_sigma(sigma)
@@ -761,6 +827,10 @@ def guided_denoise_loop(
             and last_video_x0 is not None
             and last_audio_x0 is not None
         ):
+            # Republish the reused estimate so the preview's forward counter keeps
+            # matching the schedule length even when a guider skips a step.
+            if preview is not None:
+                preview.publish(last_video_x0, sigma)
             if diffusion_step is None:
                 video_x = euler_step(video_x, last_video_x0, sigma, sigma_next)
                 audio_x = euler_step(audio_x, last_audio_x0, sigma, sigma_next)
@@ -949,6 +1019,9 @@ def guided_denoise_loop(
         last_video_x0 = video_x0
         last_audio_x0 = audio_x0
 
+        if preview is not None:
+            preview.publish(video_x0, sigma)
+
         # Euler step, or the ancestral (SDE) step when the checkpoint asks for it
         if diffusion_step is None:
             video_x = euler_step(video_x, video_x0, sigma, sigma_next)
@@ -959,6 +1032,9 @@ def guided_denoise_loop(
 
         # Force computation for memory efficiency
         mx.async_eval(video_x, audio_x)
+
+    if preview is not None:
+        preview.check_abort("after the last step")
 
     aggressive_cleanup()
 

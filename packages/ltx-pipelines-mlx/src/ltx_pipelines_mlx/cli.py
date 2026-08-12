@@ -19,8 +19,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
+from pathlib import Path
 
 DEFAULT_MODEL = "dgrauet/ltx-2.3-mlx-q8"
 DEFAULT_GEMMA = "mlx-community/gemma-3-12b-it-4bit"
@@ -38,6 +40,75 @@ def _add_base_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--seed", "-s", type=int, default=-1, help="Random seed (-1 = random)")
     parser.add_argument("--quiet", "-q", action="store_true", help="Suppress progress output")
+
+
+def _add_live_preview_args(parser: argparse.ArgumentParser) -> None:
+    """Add the live-preview / early-abort flags. Default off; nothing changes when off."""
+    parser.add_argument(
+        "--live-preview",
+        choices=("off", "tae"),
+        default="off",
+        help=(
+            "Write a thumbnail of the current denoised estimate after every forward, so a "
+            "bad take can be stopped early. 'tae' needs --live-preview-tae (or "
+            "$LTX2_TAE_CHECKPOINT). Supported on --distilled / --two-stage / --two-stages-hq. "
+            "Output is byte-identical with it on or off."
+        ),
+    )
+    parser.add_argument(
+        "--live-preview-tae",
+        default=os.environ.get("LTX2_TAE_CHECKPOINT"),
+        help="Path to madebyollin taeltx2_3.safetensors (default: $LTX2_TAE_CHECKPOINT)",
+    )
+    parser.add_argument("--live-preview-dir", default=None, help="Preview directory (default: <output dir>/live)")
+    parser.add_argument("--live-preview-every", type=int, default=1, help="Publish every Nth estimate (default: 1)")
+    parser.add_argument(
+        "--live-preview-latent-frame",
+        type=int,
+        default=None,
+        help="Latent frame to preview (default: the middle one)",
+    )
+    parser.add_argument(
+        "--live-preview-context",
+        type=int,
+        default=None,
+        help=(
+            "Causal warm-up latent frames handed to the tiny decoder (default: 2). The "
+            "decoder's MemBlocks remember the previous frame, so 0 decodes the frame as if it "
+            "opened the clip."
+        ),
+    )
+    parser.add_argument(
+        "--live-preview-downscale",
+        type=int,
+        default=0,
+        help="0 = auto memory guard (default), 1 = full-resolution thumbnail, 2 = half, ...",
+    )
+
+
+def _build_live_preview(args: argparse.Namespace):
+    """Return a ``LivePreviewMonitor`` for this render, or ``None`` when the flag is off."""
+    if getattr(args, "live_preview", "off") == "off":
+        return None
+    if not args.live_preview_tae:
+        raise SystemExit(
+            "--live-preview tae needs a tiny-decoder checkpoint: pass --live-preview-tae "
+            "/path/to/taeltx2_3.safetensors or set $LTX2_TAE_CHECKPOINT. The file is the "
+            "decoder half of madebyollin/taehv (MIT), ~22 MB."
+        )
+    from ltx_pipelines_mlx.live_preview import LivePreviewMonitor
+
+    output = Path(args.output)
+    directory = Path(args.live_preview_dir) if args.live_preview_dir else output.parent / "live"
+    kwargs: dict = dict(
+        output=output,
+        every=args.live_preview_every,
+        latent_frame=args.live_preview_latent_frame,
+        downscale=args.live_preview_downscale,
+    )
+    if args.live_preview_context is not None:
+        kwargs["context"] = args.live_preview_context
+    return LivePreviewMonitor(directory, Path(args.live_preview_tae), **kwargs)
 
 
 def _build_tile_count_config(args: argparse.Namespace):
@@ -260,6 +331,7 @@ examples:
             "faster but lossier). Ignored unless --enable-teacache is set."
         ),
     )
+    _add_live_preview_args(gen)
     gen.add_argument("--enhance-prompt", action="store_true", help="Enhance prompt using Gemma before generation")
     gen.add_argument(
         "--lora",
@@ -674,6 +746,32 @@ examples:
 # =============================================================================
 
 
+def _run_with_live_preview(pipe, kwargs: dict, monitor) -> None:
+    """Run ``generate_and_save`` and turn an ABORT sentinel into exit 75.
+
+    Exit **75** means "the user stopped this" — distinct from 0 (done) and from 1 (the
+    ordinary traceback exit), so a supervisor never has to parse output to tell a cancel
+    from a crash. The abort happens during denoise, before any encode, so no mp4, wav or
+    frames directory is left behind.
+    """
+    if monitor is None:
+        pipe.generate_and_save(**kwargs)
+        return
+
+    from ltx_pipelines_mlx.live_preview import ABORT_EXIT_CODE, LivePreviewAborted
+
+    try:
+        pipe.generate_and_save(**kwargs)
+    except LivePreviewAborted as stop:
+        print(f"ABORTED: {stop}", file=sys.stderr)
+        raise SystemExit(ABORT_EXIT_CODE) from None
+    except BaseException:
+        monitor.finish("error")
+        raise
+    monitor.finish("done", extra={"summary": monitor.summary()})
+    print(f"Live preview: {monitor.summary()}")
+
+
 def _cmd_generate(args: argparse.Namespace) -> None:
     """Generate a video from a text prompt (and optionally a reference image)."""
     t0 = time.time()
@@ -705,6 +803,13 @@ def _cmd_generate(args: argparse.Namespace) -> None:
 
     if sum(map(bool, (args.two_stages_hq, args.two_stage, args.distilled, args.one_stage))) > 1:
         raise SystemExit("Choose at most one of --two-stage, --two-stages-hq, --distilled, --one-stage.")
+
+    if getattr(args, "live_preview", "off") != "off" and args.one_stage:
+        raise SystemExit(
+            "--live-preview is wired on --distilled / --two-stage / --two-stages-hq. The "
+            "one-stage pipeline has no preview hook yet."
+        )
+    live_preview = _build_live_preview(args)
 
     if args.one_stage:
         from ltx_pipelines_mlx.ti2vid_one_stage import TI2VidOneStagePipeline
@@ -782,7 +887,9 @@ def _cmd_generate(args: argparse.Namespace) -> None:
             kwargs["stage2_steps"] = args.stage2_steps
         if relay is not None:
             kwargs["prompt_relay"] = relay
-        pipe.generate_and_save(**kwargs)
+        if live_preview is not None:
+            kwargs["live_preview"] = live_preview
+        _run_with_live_preview(pipe, kwargs, live_preview)
 
     elif args.two_stages_hq or args.two_stage:
         if args.two_stages_hq:
@@ -839,7 +946,9 @@ def _cmd_generate(args: argparse.Namespace) -> None:
                 kwargs["teacache_thresh"] = args.teacache_thresh
         if relay is not None:
             kwargs["prompt_relay"] = relay
-        pipe.generate_and_save(**kwargs)
+        if live_preview is not None:
+            kwargs["live_preview"] = live_preview
+        _run_with_live_preview(pipe, kwargs, live_preview)
 
     else:
         raise SystemExit(
