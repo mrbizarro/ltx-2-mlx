@@ -61,7 +61,11 @@ def main(argv=None) -> int:
 
     from ltx_pipelines_mlx.cli import main as cli_main
 
-    return cli_main(rest)
+    # ``cli.main()`` takes no arguments — it parses ``sys.argv`` itself. Handing it a list
+    # raised ``TypeError: main() takes 0 positional arguments``, i.e. this wrapper could
+    # never have run against the current CLI. Rewrite argv instead.
+    sys.argv = [sys.argv[0], *rest]
+    return cli_main()
 
 
 if __name__ == "__main__":
