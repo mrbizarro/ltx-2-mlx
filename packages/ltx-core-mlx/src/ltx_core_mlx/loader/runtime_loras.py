@@ -409,6 +409,15 @@ def attach_loras(
             )
             continue
 
+        if isinstance(base, (LoRAQuantizedLinear, LoRALinear)):
+            # Attaching twice must not silently discard the first LoRA. Wrapping
+            # an adapter in another adapter would: the outer one adopts weight /
+            # scales / biases by reference but knows nothing of the inner one's
+            # branch. Fold the existing branch in as another delta instead — the
+            # same rank-axis concatenation used for multiple LoRAs in one call.
+            deltas = [(base["lora_a"], base["lora_b"] * base.lora_scale, 1.0), *deltas]
+            rank += int(base["lora_a"].shape[0])
+
         in_features = _logical_in_features(base)
         out_features = int(base["weight"].shape[0])
         bad = next(

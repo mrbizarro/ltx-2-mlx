@@ -403,6 +403,37 @@ def test_two_loras_on_one_module_concatenate_on_the_rank_axis():
     assert _rel(got, want) < 1e-5
 
 
+def test_attaching_twice_merges_instead_of_discarding_the_first_lora():
+    """Re-attaching must not wrap an adapter in an adapter.
+
+    The outer adapter adopts ``weight`` / ``scales`` / ``biases`` by reference
+    and knows nothing of the inner one's branch, so a naive second wrap would
+    drop the first LoRA — silently, with the render still "working". A second
+    attach folds into the existing branch instead.
+    """
+    mx.random.seed(25)
+    model = _Tiny(blocks=1)
+    nn.quantize(model, group_size=GROUP_SIZE, bits=4)
+    target = "transformer_blocks.0.attn1.to_q"
+    base = model.transformer_blocks[0].attn1.to_q
+    x = mx.random.normal((3, 128))
+    baseline = base(x)
+
+    a1 = mx.random.normal((4, 128)) * 0.01
+    b1 = mx.random.normal((128, 4)) * 0.01
+    a2 = mx.random.normal((6, 128)) * 0.01
+    b2 = mx.random.normal((128, 6)) * 0.01
+    attach_loras(model, [_spec({f"{target}.lora_A.weight": a1, f"{target}.lora_B.weight": b1}, 0.5)], verbose=False)
+    report = attach_loras(
+        model, [_spec({f"{target}.lora_A.weight": a2, f"{target}.lora_B.weight": b2}, 1.5)], verbose=False
+    )
+
+    assert report.applied[0].rank == 10, "the first LoRA's rank must still be carried"
+    got = model.transformer_blocks[0].attn1.to_q(x) - baseline
+    want = 0.5 * (x @ a1.T) @ b1.T + 1.5 * (x @ a2.T) @ b2.T
+    assert _rel(got, want) < 1e-5
+
+
 def test_a_comfy_shaped_lora_file_reaches_the_model_through_the_rename_map(tmp_path):
     """File → ``LTXV_LORA_COMFY_RENAMING_MAP`` → module tree, end to end.
 
