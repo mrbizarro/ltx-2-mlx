@@ -441,3 +441,172 @@ def test_the_ic_lora_warning_can_never_break_a_render():
 
     for junk in (None, object(), 0, "not a model"):
         warn(junk, 1)
+
+
+# --------------------------------------------------------------------------- #
+# 8. isolated-modality guidance: OFF by default on 2.5, untouched on 2.3
+# --------------------------------------------------------------------------- #
+#
+# This is the one section in this file that pins a **deliberate output change**
+# rather than an invariance. Isolated-modality guidance is a real guidance term;
+# turning it off changes the picture. It is off on 2.5 because it was measured
+# and then graded by eye, not because it was proved neutral:
+#
+#   arm G_modality_off, 1024x576x121, seed 774411, LTX-2.5 q8 dev + distilled
+#   LoRA 450: 306.9 s -> 246.2 s (-60.7 s, -19.8 %), peak footprint unmoved
+#   (39.52 vs 39.53 GB). Owner verdict 2026-08-12: "G modality is nice" (PASS).
+#   The sibling arm that buys the same 61 s by dropping CFG instead was FAILED
+#   ("D2 changes character and has visual weirdness") — hence CFG is untouched
+#   here and only the modality pass goes.
+#
+# Evidence: ~/AI/projects/phosphene/notes/ltx25_perf_exp1.md (arm G_modality_off)
+# and board row 1 of ltx25_perf_board.md.
+#
+# The 2.3 assertions below are the load-bearing half. TI2VidTwoStagesHQPipeline
+# is generation-agnostic — `ltx-2-mlx generate --two-stages-hq` against a 2.3
+# checkpoint reaches this exact code — so a default that was not version-keyed
+# would have silently changed 2.3 as well.
+
+
+def test_modality_guidance_is_off_by_default_on_25_and_sft_on_23():
+    from ltx_pipelines_mlx.ti2vid_two_stages_hq import (
+        MODALITY_SCALE_NEUTRAL,
+        MODALITY_SCALE_SFT,
+        resolve_modality_scale,
+    )
+
+    assert MODALITY_SCALE_SFT == 3.0
+    assert MODALITY_SCALE_NEUTRAL == 1.0
+
+    assert resolve_modality_scale((2, 5)) == MODALITY_SCALE_NEUTRAL
+    assert resolve_modality_scale((2, 6)) == MODALITY_SCALE_NEUTRAL
+    assert resolve_modality_scale((3, 0)) == MODALITY_SCALE_NEUTRAL
+
+    # 2.3 and anything older keeps the SFT value it shipped with.
+    assert resolve_modality_scale((2, 3)) == MODALITY_SCALE_SFT
+    assert resolve_modality_scale((2, 0)) == MODALITY_SCALE_SFT
+    # an unreadable checkpoint yields (), which must NOT opt into the change
+    assert resolve_modality_scale(()) == MODALITY_SCALE_SFT
+
+
+def test_the_23_hq_defaults_are_byte_for_byte_what_they_always_were():
+    """The regression that would matter most: keying the default by generation
+    but getting the comparison backwards, or letting it leak onto 2.3.
+
+    `LTX_2_3_HQ_PARAMS` is the reference table this path has always built, so
+    it is compared field by field rather than on modality_scale alone — a
+    version-keyed edit that also nudged rescale_scale or the audio CFG would
+    pass a modality-only assertion."""
+    from ltx_pipelines_mlx.ti2vid_two_stages_hq import build_hq_guider_params
+    from ltx_pipelines_mlx.utils.constants import LTX_2_3_HQ_PARAMS
+
+    video, audio = build_hq_guider_params((2, 3), cfg_scale=3.0, stg_scale=0.0)
+
+    pairs = (
+        (video, LTX_2_3_HQ_PARAMS.video_guider_params),
+        (audio, LTX_2_3_HQ_PARAMS.audio_guider_params),
+    )
+    for built, reference in pairs:
+        assert built.cfg_scale == reference.cfg_scale
+        assert built.stg_scale == reference.stg_scale
+        assert built.stg_blocks == reference.stg_blocks
+        assert built.rescale_scale == reference.rescale_scale
+        assert built.modality_scale == reference.modality_scale == 3.0
+        assert built.skip_step == reference.skip_step
+
+
+def test_only_the_modality_scale_moves_between_23_and_25():
+    """The change is one field wide. Asserting *that* is what stops a future
+    edit from riding along on the same version key."""
+    from dataclasses import fields
+
+    from ltx_pipelines_mlx.ti2vid_two_stages_hq import build_hq_guider_params
+
+    v23, a23 = build_hq_guider_params((2, 3), cfg_scale=3.0, stg_scale=0.0)
+    v25, a25 = build_hq_guider_params((2, 5), cfg_scale=3.0, stg_scale=0.0)
+
+    for old, new in ((v23, v25), (a23, a25)):
+        differing = [f.name for f in fields(old) if getattr(old, f.name) != getattr(new, f.name)]
+        assert differing == ["modality_scale"], differing
+        assert old.modality_scale == 3.0 and new.modality_scale == 1.0
+
+
+def test_a_25_default_actually_switches_the_isolated_modality_pass_off():
+    """The number is only a saving if the guider stops asking for the pass.
+
+    `_predict` builds the isolated-modality forward iff
+    `do_isolated_modality_generation()` is true on either guider, so that
+    predicate — not the float — is what the 61 seconds are made of."""
+    from ltx_core_mlx.components.guiders import MultiModalGuider
+    from ltx_pipelines_mlx.ti2vid_two_stages_hq import build_hq_guider_params
+
+    v25, a25 = build_hq_guider_params((2, 5), cfg_scale=3.0, stg_scale=0.0)
+    assert not MultiModalGuider(params=v25).do_isolated_modality_generation()
+    assert not MultiModalGuider(params=a25).do_isolated_modality_generation()
+
+    # ...and CFG is deliberately still on, because arm D2 was FAILED by the owner.
+    assert MultiModalGuider(params=v25).do_unconditional_generation()
+    assert MultiModalGuider(params=a25).do_unconditional_generation()
+
+    v23, a23 = build_hq_guider_params((2, 3), cfg_scale=3.0, stg_scale=0.0)
+    assert MultiModalGuider(params=v23).do_isolated_modality_generation()
+    assert MultiModalGuider(params=a23).do_isolated_modality_generation()
+
+
+def test_a_caller_supplied_guider_params_still_wins_on_both_generations():
+    """The escape hatch is the pre-existing one: pass your own params. If the
+    new default overrode them, turning modality guidance back on for a 2.5
+    render would be impossible from outside the library."""
+    from ltx_pipelines_mlx.ti2vid_two_stages_hq import build_hq_guider_params
+
+    mine = MultiModalGuiderParams(cfg_scale=3.0, stg_scale=0.0, rescale_scale=0.45, modality_scale=3.0, stg_blocks=[])
+
+    for version in ((2, 3), (2, 5)):
+        video, audio = build_hq_guider_params(
+            version,
+            cfg_scale=3.0,
+            stg_scale=0.0,
+            video_guider_params=mine,
+            audio_guider_params=mine,
+        )
+        assert video is mine and audio is mine
+        assert video.modality_scale == 3.0
+
+    # ...and half an override leaves the other side on the resolved default
+    video, audio = build_hq_guider_params((2, 5), cfg_scale=3.0, stg_scale=0.0, video_guider_params=mine)
+    assert video is mine and video.modality_scale == 3.0
+    assert audio is not mine and audio.modality_scale == 1.0
+
+
+def test_the_hq_pipeline_reaches_the_resolver_rather_than_a_literal():
+    """The failure this file exists to prevent: a correct default nobody calls.
+
+    `generate_two_stage` needs 26 GB of weights, so the call site is asserted by
+    source rather than executed — but it is asserted as an ABSENCE too: a bare
+    `modality_scale=3.0` literal anywhere in this module would mean the resolver
+    was added beside the old code instead of replacing it."""
+    import inspect
+
+    from ltx_pipelines_mlx import ti2vid_two_stages_hq as hq
+
+    source = inspect.getsource(hq.TI2VidTwoStagesHQPipeline.generate_two_stage)
+    assert "build_hq_guider_params(" in source
+    assert "model_version_of(self.dit)" in source
+    assert "modality_scale=3.0" not in source
+
+    body = inspect.getsource(hq.build_hq_guider_params)
+    assert "resolve_modality_scale(" in body
+    assert "modality_scale=3.0" not in body
+
+
+def test_the_other_pipelines_keep_their_sft_modality_scale():
+    """Scope guard. The owner passed this arm on the two-stage HQ path, which is
+    the only path experiment 1 measured and the only path he graded. The Euler
+    two-stage, one-stage, a2v and retake pipelines are NOT covered by that
+    verdict and must still ship the SFT value."""
+    import inspect
+
+    from ltx_pipelines_mlx import a2vid_two_stage, retake, ti2vid_one_stage, ti2vid_two_stages
+
+    for module in (ti2vid_one_stage, ti2vid_two_stages, retake, a2vid_two_stage):
+        assert "modality_scale=3.0" in inspect.getsource(module), module.__name__

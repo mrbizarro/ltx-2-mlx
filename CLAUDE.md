@@ -622,6 +622,17 @@ The non-distilled (dev) model uses multi-modal guidance with up to 4 forward pas
 Default reference params (LTX_2_3_PARAMS): `cfg_scale=3.0`, `stg_scale=1.0`, `stg_blocks=[28]`, `rescale_scale=0.7`, `modality_scale=3.0`. Audio: `cfg_scale=7.0`.
 HQ params (LTX_2_3_HQ_PARAMS): `cfg_scale=3.0`, `stg_scale=0.0`, `stg_blocks=[]`, `rescale_scale=0.45`. Audio: `cfg_scale=7.0`, `rescale_scale=1.0`.
 
+**Default `modality_scale` on `--two-stages-hq` is version-keyed: 1.0 (OFF) from LTX-2.5, 3.0 (SFT) on 2.3.**
+`ti2vid_two_stages_hq.resolve_modality_scale` decides it from the checkpoint's own generation, the same way
+`scheduler.resolve_stage2_sigmas` does — the HQ pipeline is generation-agnostic, so a 2.3 checkpoint reaches
+the same code and must keep the value it always had. **This is a deliberate output change on 2.5, not an
+optimisation:** the isolated-modality pass is one third of every *computed* stage-1 prediction on this path, so
+dropping it took the pinned High tier from **306.9 s to 246.2 s (−19.8 %)** at 1024x576x121 with no memory
+movement, and it was adopted on a side-by-side face grade rather than on a hash. The measurement and the grade
+are recorded outside this repo (LTX-2.5 perf experiment 1, arm `G_modality_off`). CFG is deliberately untouched:
+the arm that bought the same 61 s by dropping CFG on both guiders was rejected on quality. Callers who want the
+SFT value back pass their own `video_guider_params` / `audio_guider_params`, which the default never overrides.
+
 **Default `stg_scale=0.0`**: STG requires a 3rd forward pass per step. On 32GB Mac, this causes OOM for videos longer than ~33 frames at 480x704. All pipelines default to `stg_scale=0.0` (CFG-only) for 32GB compatibility. Use `--stg-scale 1.0` for short videos only.
 
 **Memory impact**: Each extra pass doubles/triples/quadruples memory. On 32GB Mac with dev model at 480x704: CFG-only supports ~97 frames at half-res (two-stage), full guidance (4 passes) supports ~17 frames.

@@ -49,6 +49,111 @@ LTX2_HQ_TEACACHE_COEFFICIENTS: list[float] = [
 ]
 LTX2_HQ_TEACACHE_THRESH: float = 1.0  # tune per use case
 
+#: The SFT value for isolated-modality guidance — what upstream ships and what
+#: ``LTX_2_3_HQ_PARAMS`` carries. Anything other than 1.0 makes
+#: :meth:`MultiModalGuider.do_isolated_modality_generation` true, which costs a
+#: whole extra DiT forward on **every** prediction in stage 1.
+MODALITY_SCALE_SFT: float = 3.0
+
+#: The neutral value. At 1.0 the guider's modality term is
+#: ``(1 - 1) * (cond - uncond_modality) == 0`` and ``_predict`` never builds the
+#: pass at all, so the arithmetic is unchanged *and* the forward is not run.
+MODALITY_SCALE_NEUTRAL: float = 1.0
+
+#: The checkpoint generation from which this path stops running the
+#: isolated-modality pass by default. Keyed by generation for the same reason
+#: :func:`ltx_pipelines_mlx.scheduler.resolve_stage2_sigmas` is: the HQ pipeline
+#: is generation-agnostic — a 2.3 checkpoint reaches this exact code — and 2.3's
+#: measured behaviour must not move.
+MODALITY_GUIDANCE_OFF_SINCE_VERSION: tuple[int, int] = (2, 5)
+
+
+def resolve_modality_scale(model_version: tuple[int, ...]) -> float:
+    """The HQ path's default ``modality_scale`` for a checkpoint generation.
+
+    **This is a deliberate output change on LTX-2.5, not an optimisation.**
+    Isolated-modality guidance is a real guidance term; switching it off changes
+    the picture. It is defaulted off here because it was measured and then
+    passed by eye, not because it was proved neutral:
+
+    * measured — one guidance pass is one third of every *computed* stage-1
+      prediction on this path, so dropping it took the pinned High tier from
+      **306.9 s to 246.2 s (−60.7 s, −19.8 %)** at 1024x576x121, seed 774411,
+      with **no** memory movement (39.52 vs 39.53 GB peak);
+    * gated — the owner graded the two clips side by side on 2026-08-12 and
+      passed this arm ("G modality is nice") while failing the CFG arm that
+      buys the same 61 s ("D2 changes character and has visual weirdness"),
+      which is why *this* pass is the one that goes and CFG is untouched.
+
+    Evidence: ``~/AI/projects/phosphene/notes/ltx25_perf_exp1.md`` (arm
+    ``G_modality_off``), board row 1 of ``ltx25_perf_board.md``.
+
+    Args:
+        model_version: The checkpoint's generation, e.g. ``(2, 5)``. Anything
+            below ``(2, 5)`` — including the empty tuple an unreadable
+            checkpoint yields — keeps the SFT value, so LTX-2.3 and any
+            unrecognised checkpoint render exactly as they did before.
+
+    Returns:
+        ``MODALITY_SCALE_NEUTRAL`` on 2.5 and newer, ``MODALITY_SCALE_SFT``
+        otherwise. Callers that want the other value pass their own
+        ``video_guider_params`` / ``audio_guider_params``, which this default
+        never overrides.
+    """
+    if tuple(model_version) >= MODALITY_GUIDANCE_OFF_SINCE_VERSION:
+        return MODALITY_SCALE_NEUTRAL
+    return MODALITY_SCALE_SFT
+
+
+def build_hq_guider_params(
+    model_version: tuple[int, ...],
+    *,
+    cfg_scale: float,
+    stg_scale: float,
+    video_guider_params: MultiModalGuiderParams | None = None,
+    audio_guider_params: MultiModalGuiderParams | None = None,
+) -> tuple[MultiModalGuiderParams, MultiModalGuiderParams]:
+    """The HQ path's (video, audio) guider params, or the caller's if given.
+
+    Extracted from ``generate_two_stage`` so the defaults can be asserted
+    without loading 26 GB of weights. The rescale scales (0.45 video / 1.0
+    audio) and the audio CFG 7.0 are ``LTX_2_3_HQ_PARAMS`` verbatim and are
+    **not** version-keyed — only ``modality_scale`` is.
+
+    Args:
+        model_version: The checkpoint's generation, as
+            :func:`~ltx_pipelines_mlx.utils.sampler_choice.model_version_of`
+            reports it.
+        cfg_scale: The video-side CFG scale. The audio guider stays at 7.0;
+            ``_predict`` ORs the two, which is why lowering only the video one
+            removes no pass (experiment 1 §3).
+        stg_scale: Passed straight through. With ``stg_blocks=[]``,
+            ``MultiModalGuiderParams.__post_init__`` folds it to 0.0.
+        video_guider_params: Caller override. Returned untouched when set.
+        audio_guider_params: Caller override. Returned untouched when set.
+
+    Returns:
+        ``(video_params, audio_params)``.
+    """
+    modality_scale = resolve_modality_scale(model_version)
+    if video_guider_params is None:
+        video_guider_params = MultiModalGuiderParams(
+            cfg_scale=cfg_scale,
+            stg_scale=stg_scale,
+            rescale_scale=0.45,
+            modality_scale=modality_scale,
+            stg_blocks=[],
+        )
+    if audio_guider_params is None:
+        audio_guider_params = MultiModalGuiderParams(
+            cfg_scale=7.0,
+            stg_scale=stg_scale,
+            rescale_scale=1.0,
+            modality_scale=modality_scale,
+            stg_blocks=[],
+        )
+    return video_guider_params, audio_guider_params
+
 
 def _build_hq_teacache_controller(num_steps: int, thresh: float | None) -> TeaCacheController:
     """Construct an HQ-specific TeaCacheController.
@@ -194,23 +299,20 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
         sigmas_1 = ltx2_schedule(stage1_steps, num_tokens=num_tokens)
         x0_model = X0Model(self.dit)
 
-        # Build guider params (HQ defaults: no STG, lower rescale)
-        if video_guider_params is None:
-            video_guider_params = MultiModalGuiderParams(
-                cfg_scale=cfg_scale,
-                stg_scale=stg_scale,
-                rescale_scale=0.45,
-                modality_scale=3.0,
-                stg_blocks=[],
-            )
-        if audio_guider_params is None:
-            audio_guider_params = MultiModalGuiderParams(
-                cfg_scale=7.0,
-                stg_scale=stg_scale,
-                rescale_scale=1.0,
-                modality_scale=3.0,
-                stg_blocks=[],
-            )
+        # Build guider params (HQ defaults: no STG, lower rescale).
+        #
+        # ``modality_scale`` is keyed by the checkpoint's generation, exactly as
+        # the stage-2 schedule is below: 2.5 drops the isolated-modality pass
+        # (owner-passed output change, −60.7 s — see resolve_modality_scale),
+        # 2.3 keeps the SFT 3.0 it has always had. A caller-supplied
+        # ``*_guider_params`` overrides both branches and is not touched here.
+        video_guider_params, audio_guider_params = build_hq_guider_params(
+            model_version_of(self.dit),
+            cfg_scale=cfg_scale,
+            stg_scale=stg_scale,
+            video_guider_params=video_guider_params,
+            audio_guider_params=audio_guider_params,
+        )
 
         video_factory = create_multimodal_guider_factory(video_guider_params, negative_context=neg_video_embeds)
         audio_factory = create_multimodal_guider_factory(audio_guider_params, negative_context=neg_audio_embeds)
