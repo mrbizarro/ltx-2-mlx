@@ -390,3 +390,54 @@ def test_audio_rate_25_is_tokens_per_second_not_a_video_frame_rate():
     # the official template's base latent is 97 frames; at 24 fps that is not 97 tokens
     assert compute_audio_token_count(97, frame_rate=24.0) == 101
     assert compute_audio_token_count(97, frame_rate=25.0) == 97
+
+
+# --------------------------------------------------------------------------- #
+# 7. IC-LoRAs are distilled-only on 2.5 (vendor guidance)
+# --------------------------------------------------------------------------- #
+
+
+def test_ic_lora_pipeline_keeps_all_its_methods():
+    """Guard against a class-body edit accident, not against a feature.
+
+    The 2.5 warning below was first inserted between two methods at column 0,
+    which silently ENDED the class: every method after it became a module-level
+    function, `py_compile` was perfectly happy, and ICLoraPipeline lost half its
+    API. Cheap to assert, and the failure is invisible to a syntax check."""
+    from ltx_pipelines_mlx.ic_lora import ICLoraPipeline
+
+    for method in ("load", "_effective_lora_paths", "_fuse_loras", "generate_and_save"):
+        assert callable(getattr(ICLoraPipeline, method, None)), f"ICLoraPipeline lost {method}"
+
+
+def test_ic_lora_on_a_25_dev_checkpoint_warns_but_does_not_refuse(caplog):
+    """Lightricks documents the 2.5 IC-LoRAs as distilled-only ("do not use with
+    the dev checkpoint"). Our dev-mode path is the ComfyUI Union-Control recipe
+    for 2.3, which is validated — 2.5 changes the advice, not the mechanics.
+
+    A warning rather than a refusal is the deliberate choice: refusing would
+    remove a working feature from anyone whose panel routes an IC-LoRA through
+    the High tier (the HDR IC-LoRA does exactly that), and that trade is a
+    product decision. The vendor's failure mode is degraded output, not a
+    crash, so the job here is to make it attributable."""
+    import logging
+
+    from ltx_pipelines_mlx.ic_lora import _warn_if_ic_lora_on_a_25_dev_checkpoint as warn
+
+    with caplog.at_level(logging.WARNING, logger="ltx_pipelines_mlx.ic_lora"):
+        warn(FakeDit(config=LTXModelConfig(model_version=(2, 5))), 2)
+    assert "distilled-only" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="ltx_pipelines_mlx.ic_lora"):
+        warn(FakeDit(config=LTXModelConfig(model_version=(2, 3))), 2)
+    assert caplog.text == "", "2.3's Union-Control recipe is validated; it must stay silent"
+
+
+def test_the_ic_lora_warning_can_never_break_a_render():
+    """It runs on the hot path of a real generation. Anything it touches that
+    is unexpected must be swallowed, not raised."""
+    from ltx_pipelines_mlx.ic_lora import _warn_if_ic_lora_on_a_25_dev_checkpoint as warn
+
+    for junk in (None, object(), 0, "not a model"):
+        warn(junk, 1)

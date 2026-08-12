@@ -48,6 +48,40 @@ from ltx_pipelines_mlx.utils.samplers import denoise_loop
 logger = logging.getLogger(__name__)
 
 
+def _warn_if_ic_lora_on_a_25_dev_checkpoint(dit, n_loras: int) -> None:
+    """Warn when IC-LoRAs are fused into an LTX-2.5 DEV transformer.
+
+    Lightricks' 2.5 guidance is explicit that the IC-LoRAs are **distilled-only**
+    ("do not use with the dev checkpoint"). Our dev-mode path exists because the
+    ComfyUI Union-Control recipe for **2.3** is dev + IC-LoRA @1.0 +
+    distilled-lora @0.5 fused into the same model, and that recipe is validated
+    here. 2.5 changes the advice, not the mechanics.
+
+    This WARNS rather than raises, deliberately. Refusing would silently remove
+    a working feature from anyone whose panel routes an IC-LoRA through the High
+    tier (the HDR IC-LoRA does exactly that), and whether to make that trade is
+    a product decision, not a loader's. The failure mode the vendor is warning
+    about is degraded output, not a crash — so the honest thing is to make it
+    attributable rather than invisible.
+
+    Costs one config read and fires only on the dev path with LoRAs attached.
+    """
+    try:
+        from ltx_pipelines_mlx.utils.sampler_choice import model_version_of
+
+        if model_version_of(dit) >= (2, 5):
+            logger.warning(
+                "%d IC-LoRA(s) are being fused into an LTX-2.5 DEV transformer. "
+                "Lightricks documents the 2.5 IC-LoRAs as distilled-only ('do not use "
+                "with the dev checkpoint'); this is the 2.3 Union-Control recipe applied "
+                "to a generation the vendor did not sanction it for. It will render — "
+                "judge the result rather than assuming it is correct.",
+                n_loras,
+            )
+    except Exception:  # noqa: BLE001 — a warning must never break a render
+        pass
+
+
 class ICLoraPipeline(BasePipeline):
     """Two-stage video generation pipeline with IC-LoRA reference conditioning.
 
@@ -197,6 +231,12 @@ class ICLoraPipeline(BasePipeline):
             return
 
         assert self.dit is not None
+
+        # The adapters are wired HERE, and here the DiT exists — so this is the
+        # only place that can ask what generation they are being fused into.
+        # (_effective_lora_paths is a pure accessor and is called bare in tests.)
+        if self.dev_mode:
+            _warn_if_ic_lora_on_a_25_dev_checkpoint(self.dit, len(self._lora_paths))
 
         if self.low_ram_streaming:
             from ltx_core_mlx.loader.block_streaming import BlockLoraSource
