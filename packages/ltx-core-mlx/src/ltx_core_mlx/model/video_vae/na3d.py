@@ -59,6 +59,22 @@ NA_SCORE_BUDGET = 2**24
 #: knob that trades wall-clock (fewer, larger dispatches) against peak memory.
 NA_KV_STACK_BUDGET = 2**27
 
+#: How much redundant attention a query tile may carry, as ``keys_seen / kernel_volume``.
+#:
+#: A tile of queries attends to the union of their windows -- ``prod(tile + kernel - 1)``
+#: keys -- while each query only *needs* ``prod(kernel)`` of them. Everything else is
+#: masked out and thrown away, so this ratio IS the multiple of wasted attention FLOPs,
+#: and it grows fast: at stage 5 the score budget alone leaves tiles wasting 7.1x, and
+#: the (3,5,5) kernels of stages 3-4 waste **74x** because a 75-key kernel sits inside a
+#: 5544-key halo. Smaller tiles cut that at the cost of more K/V gather traffic and more
+#: dispatches. 2.5 is the knee: it takes stage 5 from 202 TFLOP to 67 and stage 4 from
+#: 4.3 to 0.19, while keeping tiles big enough to batch. ``LTX2_NA3D_MAX_WASTE``.
+NA_MAX_WINDOW_WASTE = 2.5
+
+#: Floor on tile volume, so the waste target cannot shrink tiles into per-query gathers
+#: where dispatch overhead and K/V duplication dominate. ``LTX2_NA3D_MIN_TILE``.
+NA_MIN_TILE_TOKENS = 64
+
 
 # ---------------------------------------------------------------------------
 # RoPE
@@ -148,24 +164,52 @@ def window_bounds(length: int, kernel: int) -> tuple[tuple[int, ...], tuple[int,
     return starts, tuple(s + kernel for s in starts)
 
 
-def _pick_tiles(dims: tuple[int, int, int], kernels: tuple[int, int, int], budget: int) -> list[int]:
-    """Per-axis query-tile lengths keeping one tile's ``[Nq, Nk]`` under ``budget``."""
+def _pick_tiles(
+    dims: tuple[int, int, int],
+    kernels: tuple[int, int, int],
+    budget: int,
+    max_waste: float = NA_MAX_WINDOW_WASTE,
+    min_tile_tokens: int = NA_MIN_TILE_TOKENS,
+) -> list[int]:
+    """Per-axis query-tile lengths.
+
+    Two conditions drive the halving, and they are not the same condition. The score
+    budget is about **memory** -- one tile's ``[Nq, Nk]`` mask and score block have to
+    fit. The waste target is about **work** -- see :data:`NA_MAX_WINDOW_WASTE`. The
+    vendor's CPU fallback only has the first, because on CPU it is a correctness
+    fallback and nobody runs a production decode through it. Here it is the production
+    path, so the second matters more than the first.
+    """
     tiles = list(dims)
+    kernel_vol = math.prod(kernels)
 
-    def cost(ts: list[int]) -> int:
-        nq = math.prod(ts)
-        nk = math.prod(min(d, t + k - 1) for t, k, d in zip(ts, kernels, dims, strict=True))
-        return nq * nk
+    def keys_seen(ts: list[int]) -> int:
+        return math.prod(min(d, t + k - 1) for t, k, d in zip(ts, kernels, dims, strict=True))
 
-    while cost(tiles) > budget and max(tiles) > 1:
+    while max(tiles) > 1:
+        nq, nk = math.prod(tiles), keys_seen(tiles)
         i = max(range(3), key=lambda a: tiles[a] / kernels[a])
         if tiles[i] <= 1:
+            break
+        next_nq = nq // tiles[i] * max(1, (tiles[i] + 1) // 2)
+        over_budget = nq * nk > budget
+        # The floor is checked against what the halving would *produce*, so a tile
+        # never overshoots it; the budget overrides the floor, since not fitting is
+        # not a trade-off.
+        wasteful = nk > max_waste * kernel_vol and next_nq >= min_tile_tokens
+        if not (over_budget or wasteful):
             break
         tiles[i] = max(1, (tiles[i] + 1) // 2)
     return tiles
 
 
-@lru_cache(maxsize=64)
+def _env_float(name: str, default: float) -> float:
+    import os
+
+    return float(os.environ.get(name, default))
+
+
+@lru_cache(maxsize=256)
 def _group_mask(rel_bounds: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]) -> mx.array:
     """Boolean ``[1, 1, Nq, Nk]`` visibility mask for one tile geometry.
 
@@ -211,7 +255,13 @@ def na3d(
         q = q * scale
 
     bounds = [window_bounds(d, k_) for d, k_ in zip(dims, kernels, strict=True)]
-    tile_t, tile_h, tile_w = _pick_tiles(dims, kernels, score_budget)
+    tile_t, tile_h, tile_w = _pick_tiles(
+        dims,
+        kernels,
+        score_budget,
+        max_waste=_env_float("LTX2_NA3D_MAX_WASTE", NA_MAX_WINDOW_WASTE),
+        min_tile_tokens=int(_env_float("LTX2_NA3D_MIN_TILE", NA_MIN_TILE_TOKENS)),
+    )
 
     # Group query tiles by *relative* window geometry so one mask serves many tiles.
     groups: dict[tuple, list[tuple[tuple[int, int, int, int, int, int], tuple[int, int, int, int, int, int]]]] = {}

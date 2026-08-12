@@ -470,12 +470,23 @@ class NADiffusionDecoder(nn.Module):
         key: mx.array | None = None,
         drop_leading_frame: bool = True,
         pad_trailing: bool = True,
+        x_t: mx.array | None = None,
     ) -> mx.array:
+        """``x_t`` lets a tiled caller supply the noise instead of drawing it here.
+
+        That matters more than it looks: this is a one-step x0 prediction *from* noise,
+        so the noise is an input the output depends on. Two overlapping tiles drawing
+        their own noise would predict two different realisations of the same frames, and
+        cross-fading them softens exactly the detail this decoder exists to add.
+        """
         context = self.forward_pre_diffusion(z_cl, drop_leading_frame, pad_trailing)
         mx.eval(context)
         b, t5, h5, w5, _ = context.shape
         pixel_shape = (b, t5, h5 * self.patch_size, w5 * self.patch_size, self.out_channels)
-        x_t = mx.random.normal(pixel_shape, dtype=mx.float32, key=key).astype(z_cl.dtype)
+        if x_t is None:
+            x_t = mx.random.normal(pixel_shape, dtype=mx.float32, key=key).astype(z_cl.dtype)
+        elif tuple(x_t.shape) != pixel_shape:
+            raise ValueError(f"supplied x_t {tuple(x_t.shape)} does not match the decoder's {pixel_shape}")
 
         steps = self.num_inference_steps
         timesteps = [1.0 - i * (1.0 - 1.0 / steps) / max(1, steps - 1) for i in range(steps)] if steps > 1 else [1.0]
@@ -618,17 +629,26 @@ class DiffusionVideoDecoder(nn.Module):
         up = self.temporal_upscale
         f_lat = x.shape[1]
         total = f_lat * up - (up - 1)
+        # ONE noise volume for the whole clip, sliced per tile: overlapping frames must
+        # get the same noise or the cross-fade averages two different predictions.
+        noise = mx.random.normal(
+            (x.shape[0], total, x.shape[2] * self.spatial_upscale, x.shape[3] * self.spatial_upscale, 3),
+            dtype=mx.float32,
+            key=key,
+        ).astype(x.dtype)
+        mx.eval(noise)
         acc: mx.array | None = None
         wsum: mx.array | None = None
         for idx, (t0, t1) in enumerate(tiles):
+            start = 0 if t0 == 0 else t0 * up - (up - 1)
+            n_expect = (t1 - t0) * up - (up - 1 if t0 == 0 else 0)
             sub = self.decoder(
                 x[:, t0:t1],
-                key=mx.random.split(key, len(tiles))[idx],
                 drop_leading_frame=(t0 == 0),
                 pad_trailing=(t1 == f_lat),
+                x_t=noise[:, start : start + n_expect],
             )
             mx.eval(sub)
-            start = 0 if t0 == 0 else t0 * up - (up - 1)
             n = sub.shape[1]
             if acc is None:
                 acc = mx.zeros((sub.shape[0], total, sub.shape[2], sub.shape[3], sub.shape[4]), dtype=mx.float32)

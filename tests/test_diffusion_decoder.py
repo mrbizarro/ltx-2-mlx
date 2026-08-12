@@ -482,3 +482,24 @@ def test_strict_load_rejects_a_pack_missing_a_module():
     weights.pop("vae_decoder_diffusion.decoder.conv_out.weight")
     with pytest.raises(ValueError):
         load_diffusion_decoder(weights, TINY_CFG)
+
+
+def test_decode_is_deterministic_for_a_seed():
+    """One-step x0 from noise means the noise is an input, not an implementation
+    detail. Same seed, same pixels -- otherwise no A/B between decoders is meaningful."""
+    model, _ = _tiny_model_and_params()
+    latent = mx.random.normal((1, 8, 2, 3, 3)) * 0.5
+    a = np.asarray(model.decode(latent, seed=3))
+    b = np.asarray(model.decode(latent, seed=3))
+    c = np.asarray(model.decode(latent, seed=4))
+    np.testing.assert_array_equal(a, b)
+    assert not np.array_equal(a, c), "a different seed produced identical pixels"
+
+
+def test_supplied_noise_must_match_the_decoder_geometry():
+    """The tiled path slices one noise volume so overlapping frames share their noise.
+    A mis-sliced tile must fail loudly rather than decode a shifted realisation."""
+    model, _ = _tiny_model_and_params()
+    z = mx.zeros((1, 2, 3, 3, 8))
+    with pytest.raises(ValueError, match="does not match"):
+        model.decoder(z, x_t=mx.zeros((1, 5, 96, 96, 3)))
