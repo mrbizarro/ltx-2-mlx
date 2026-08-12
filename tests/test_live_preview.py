@@ -61,13 +61,15 @@ def _status(monitor) -> dict:
 # --- geometry --------------------------------------------------------------------------
 
 
-def test_latent_frame_maps_to_the_pixel_frame_the_vae_would_produce():
-    # LTX groups pixel frames (1, 8, 8, ...) per latent frame: the same arithmetic
-    # compute_video_positions uses, max(0, i * 8 - 7).
+def test_latent_frame_maps_to_the_pixel_frame_the_preview_actually_shows():
+    # Latent frame i covers delivered frames max(0, 8i-7)..8i, and local_output_index decodes
+    # the LAST of them, so this must name the last one. It is also the final frame index of a
+    # full clip: 7 latent frames -> 49 delivered -> 8*6 = 48.
     assert approximate_output_frame(0) == 0
-    assert approximate_output_frame(1) == 1
-    assert approximate_output_frame(2) == 9
-    assert approximate_output_frame(6) == 41
+    assert approximate_output_frame(1) == 8
+    assert approximate_output_frame(3) == 24
+    assert approximate_output_frame(6) == 48
+    assert approximate_output_frame(15) == 120  # 16 latent frames -> 121 delivered
 
 
 def test_the_previewed_token_lands_on_the_last_decoded_frame():
@@ -134,6 +136,7 @@ def test_a_published_forward_writes_a_png_and_a_stable_latest_path(tmp_path):
     assert status["preview_width"] == 16 * 32
     assert status["preview_height"] == 9 * 32
     assert status["latent_frame"] == 3
+    assert status["approx_output_frame"] == 24  # the frame the thumbnail actually shows
     assert (monitor.directory / "preview_01.png").exists()
     latest = (monitor.directory / "preview_latest.png").read_bytes()
     assert latest == (monitor.directory / "preview_01.png").read_bytes()

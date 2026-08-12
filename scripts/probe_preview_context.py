@@ -36,7 +36,7 @@ for pkg in ("ltx-core-mlx", "ltx-pipelines-mlx"):
 import mlx.core as mx  # noqa: E402
 import numpy as np  # noqa: E402
 
-from ltx_pipelines_mlx.live_preview import local_output_index  # noqa: E402
+from ltx_pipelines_mlx.live_preview import approximate_output_frame, local_output_index  # noqa: E402
 from ltx_pipelines_mlx.tiny_video_vae import load_tiny_ltx_video_decoder  # noqa: E402
 
 
@@ -132,8 +132,11 @@ def main() -> int:
 
     # --- (d) how much causal warm-up does one frame need? ---
     target = frames // 2
-    truth = full_np[local_output_index(target)] if target * 8 <= len(full_np) else full_np[8 * target - 7]
-    truth = full_np[min(len(full_np) - 1, max(0, 8 * target - 7))]
+    # The partial decode returns the target token's LAST frame (local index 8*context), which
+    # globally is frame 8*target. Comparing against 8*target-7 compares two different moments
+    # and makes context look useless — that was the first version's bug.
+    truth_index = min(len(full_np) - 1, approximate_output_frame(target))
+    truth = full_np[truth_index]
     context_rows = []
     for k in args.contexts:
         if k > target:
@@ -157,7 +160,7 @@ def main() -> int:
         print(f"  context {k}: {seconds:.3f}s  mean|diff| {context_rows[-1]['mean_abs_diff_255']:.3f}/255  "
               f"corr {context_rows[-1]['composition_correlation']:.5f}")
     report["context_sweep"] = context_rows
-    report["context_truth_frame"] = int(min(len(full_np) - 1, max(0, 8 * target - 7)))
+    report["context_truth_frame"] = int(truth_index)
     report["previewed_latent_frame"] = target
 
     # A strip: naive (context 0) | shipped default | full-clip TAE | delivered

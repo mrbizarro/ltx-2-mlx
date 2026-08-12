@@ -118,13 +118,17 @@ def local_output_index(context: int) -> int:
 
 
 def approximate_output_frame(latent_frame: int) -> int:
-    """First delivered pixel frame covered by ``latent_frame``.
+    """The delivered pixel frame the preview actually shows.
 
-    LTX's video VAE groups pixel frames ``(1, 8, 8, 8, ...)`` per latent frame, which is the
-    same arithmetic ``compute_video_positions`` uses (``max(0, i * 8 - 7)``). Reported in
-    ``status.json`` purely so a viewer knows *which* moment of the clip it is looking at.
+    LTX's video VAE groups pixel frames ``(1, 8, 8, 8, ...)`` per latent frame, so latent
+    frame ``i`` covers delivered frames ``max(0, 8i - 7) .. 8i``. :func:`local_output_index`
+    decodes the **last** of those, so this must name the last one too — ``8i`` — not the first.
+    Getting this wrong is invisible in the thumbnail and silently mislabels which moment of
+    the clip a viewer is looking at (and made the first context probe compare two different
+    frames). ``8i`` is also exactly the final frame index for a full clip: ``(F-1)*8`` with
+    ``F`` latent frames and ``(F-1)*8+1`` delivered frames.
     """
-    return max(0, int(latent_frame) * 8 - 7)
+    return max(0, int(latent_frame) * 8)
 
 
 class LivePreviewMonitor:
