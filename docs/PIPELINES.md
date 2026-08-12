@@ -61,6 +61,7 @@ by tier, see [PIPELINE_MATURITY.md](PIPELINE_MATURITY.md).
 
 ## Compatibility notes
 
+- **`--lora-mode {auto,unfused,fuse}`** applies to every `generate` mode. `auto` (default) applies the LoRA as an **unfused runtime branch** on a quantized pack and fuses it into the weights on a float one. Fusing into a quantized weight destroys **~95 %** of a rank-32 delta at q4 (~10 % at q8) — the documented cause of character LoRAs "not triggering". `fuse` is kept as the honest A/B control and now measures + reports what it costs. `--lora-mode unfused` is **not available with `--low-ram`** and raises rather than silently fusing.
 - `generate --lora <path>` (one-stage) is **incompatible with `--low-ram`** (LoRA pre-fuse happens before streaming setup). Use `ic-lora` or pre-fuse via mlx-forge.
 - `--low-ram` + custom `--distilled-lora-strength` (≠1.0) on two-stage uses bind-time LoRA fusion (slower per step but supports any strength). At strength=1.0, swaps to pre-fused `transformer-distilled.safetensors`.
 - TeaCache calibration is sampler-specific (Euler vs res_2s). Don't reuse coefficients across `--two-stage` and `--two-stages-hq`.
