@@ -745,6 +745,11 @@ NON_TEXT_PREFIXES: tuple[str, ...] = (
     "vision_model",
     "audio_model",
     "multi_modal_projector",
+    # LTX-2.5's encoder ships this beside multi_modal_projector — the audio
+    # half of the same unified-multimodal packaging. Confirmed present in the
+    # real checkpoint header; without it a strict load fails on a tensor this
+    # tower correctly never builds.
+    "audio_projector",
     "embed_vision",
     "embed_audio",
     "vision_embedder",
