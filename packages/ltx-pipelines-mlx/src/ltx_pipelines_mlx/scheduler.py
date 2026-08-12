@@ -353,10 +353,23 @@ def resolve_distilled_schedule(
 ) -> tuple[list[float], list[float]]:
     """Both sigma schedules for one distilled two-stage render.
 
-    Precedence, per stage independently: an explicit sigma list wins; otherwise
-    a step count thins the preset's table; otherwise the preset is used whole.
+    Precedence, per stage independently:
+
+    1. an explicit sigma list wins;
+    2. else a step count thins **the checkpoint's own full schedule** — the
+       ``vendor`` preset for this generation — to that many steps;
+    3. else the chosen preset's list is used whole.
+
     Passing an explicit list *and* a step count for the same stage is a
     contradiction and raises rather than picking one.
+
+    **Step 2 deliberately thins the vendor table rather than the chosen
+    preset's.** A step count is a request about the checkpoint ("give me N of
+    its steps"), not about a preset, and reading it the other way would make
+    ``stage2_steps=3`` — which the Phosphene panel and this package's own
+    ic-lora / lipdub / keyframe defaults all pass explicitly — *fail* on
+    LTX-2.5, because the adopted default holds only 2. A shipped default must
+    not turn an existing caller's arguments into an error.
 
     Args:
         model_version: The checkpoint's generation, from
@@ -369,8 +382,10 @@ def resolve_distilled_schedule(
             to it (``noise*sigma + stage1*(1-sigma)``), so on LTX-2.5's 0.85 only
             15 % of stage 1 survives into the refine. Moving it changes far more
             than one step.
-        stage1_steps: Thin stage 1 to this many steps.
-        stage2_steps: Thin stage 2 to this many steps.
+        stage1_steps: Thin the checkpoint's stage-1 table to this many steps.
+        stage2_steps: Thin the checkpoint's stage-2 table to this many steps.
+            On LTX-2.5 that table is the vendor's 3-step list, so ``3`` returns
+            it whole and ``2`` returns the adopted default.
 
     Returns:
         ``(sigmas_1, sigmas_2)``, both terminating at 0.0.
@@ -390,8 +405,9 @@ def resolve_distilled_schedule(
             f"distilled checkpoint and are not offered on older ones.)"
         )
     base_1, base_2 = presets[chosen].as_lists()
+    full_1, full_2 = presets["vendor"].as_lists()
 
-    def _one(stage: str, base: list[float], explicit, steps: int | None) -> list[float]:
+    def _one(stage: str, base: list[float], full: list[float], explicit, steps: int | None) -> list[float]:
         flag = f"--stage{stage}-sigmas"
         if explicit is not None:
             if steps is not None:
@@ -400,15 +416,12 @@ def resolve_distilled_schedule(
                     f"schedule already says how many steps it has."
                 )
             return validate_sigmas(explicit, name=flag, max_points=DISTILLED_MAX_POINTS)
-        return validate_sigmas(
-            thin_sigmas(base, steps, name=f"stage {stage}"),
-            name=f"stage {stage}",
-            max_points=DISTILLED_MAX_POINTS,
-        )
+        resolved = base if steps is None or steps == 0 else thin_sigmas(full, steps, name=f"stage {stage}")
+        return validate_sigmas(resolved, name=f"stage {stage}", max_points=DISTILLED_MAX_POINTS)
 
     return (
-        _one("1", base_1, stage1_sigmas, stage1_steps),
-        _one("2", base_2, stage2_sigmas, stage2_steps),
+        _one("1", base_1, full_1, stage1_sigmas, stage1_steps),
+        _one("2", base_2, full_2, stage2_sigmas, stage2_steps),
     )
 
 

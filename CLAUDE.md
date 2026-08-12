@@ -530,7 +530,11 @@ residual noise while reporting itself as "2 steps". Every distilled call site in
 the package (distilled, ic-lora, lipdub, keyframe, a2v) now goes through
 `scheduler.thin_sigmas`, which keeps both endpoints and drops interior points at
 a uniform index stride, and **refuses** a count the table cannot supply rather
-than guessing. Pinned by `tests/test_distilled_schedule.py`, which walks every
+than guessing. A step count addresses the **checkpoint's own** schedule (the
+`vendor` preset), not whichever preset the caller picked — otherwise the panel's
+`stage2_steps=3`, and ic-lora / lipdub / keyframe's own defaults, would start
+raising the moment 2.5's default dropped to 2 steps. Pinned by
+`tests/test_distilled_schedule.py`, which walks every
 table × step count × preset × generation, plus a package-wide grep so the wart
 cannot come back through a fifth call site.
 

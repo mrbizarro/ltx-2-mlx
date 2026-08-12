@@ -97,7 +97,10 @@ class TestEveryReachableScheduleTerminates:
     @pytest.mark.parametrize("version", GENERATIONS)
     def test_resolve_distilled_schedule_over_presets_and_steps(self, version):
         for preset in distilled_presets_for(version):
-            base_1, base_2 = distilled_presets_for(version)[preset].as_lists()
+            # A step count addresses the checkpoint's own table (the vendor
+            # preset), so that is what bounds the legal range — not the
+            # possibly-thinner preset the caller picked.
+            base_1, base_2 = distilled_presets_for(version)["vendor"].as_lists()
             for s1 in [None, *range(1, len(base_1))]:
                 for s2 in [None, *range(1, len(base_2))]:
                     got_1, got_2 = resolve_distilled_schedule(version, preset=preset, stage1_steps=s1, stage2_steps=s2)
@@ -116,6 +119,18 @@ class TestEveryReachableScheduleTerminates:
         _, stage2 = resolve_distilled_schedule((2, 5), preset="vendor", stage2_steps=2)
         assert stage2 == [0.85, 0.421875, 0.0]
         assert stage2 != STAGE_2_SIGMAS_LTX25[:3], "that slice is the bug: it stops at 0.421875"
+
+    def test_an_existing_callers_stage2_steps_3_still_means_the_vendor_list(self):
+        """The Phosphene panel — and this package's ic-lora / lipdub / keyframe
+        defaults — pass ``stage2_steps=3`` explicitly. The adopted 2.5 default
+        holds only 2 steps, so a step count that thinned *the preset* would turn
+        those existing calls into a ValueError. A step count thins the
+        CHECKPOINT's table instead, which keeps every one of them working."""
+        for preset in DISTILLED_PRESET_NAMES:
+            _, stage2 = resolve_distilled_schedule((2, 5), preset=preset, stage2_steps=3)
+            assert stage2 == STAGE_2_SIGMAS_LTX25
+        stage1, _ = resolve_distilled_schedule((2, 5), preset="fast", stage1_steps=8)
+        assert stage1 == DISTILLED_SIGMAS
 
     def test_the_other_broken_call(self):
         """``--stage1-steps 5`` used to hand the upscaler a latent at sigma 0.909."""

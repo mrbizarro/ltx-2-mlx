@@ -85,6 +85,11 @@ residual noise while reporting itself as "2 steps". A step count now **thins**
 the table (both endpoints kept, interior points dropped at a uniform stride) and
 a count the table cannot supply is refused with a message.
 
+A step count addresses **the checkpoint's own schedule** — the `vendor` preset —
+not whichever preset you picked. So `--stage2-steps 3` on LTX-2.5 still returns
+the vendor 3-step list even though the default holds 2, and every existing caller
+that passes the old step counts keeps working.
+
 ### Defaults, per checkpoint generation
 
 | Generation | stage 1 | stage 2 | forwards |
