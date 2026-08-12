@@ -403,6 +403,42 @@ def test_two_loras_on_one_module_concatenate_on_the_rank_axis():
     assert _rel(got, want) < 1e-5
 
 
+def test_a_comfy_shaped_lora_file_reaches_the_model_through_the_rename_map(tmp_path):
+    """File → ``LTXV_LORA_COMFY_RENAMING_MAP`` → module tree, end to end.
+
+    The unit tests above hand ``attach_loras`` post-rename keys, so they cannot
+    catch a remapping mismatch — and a remapping mismatch is precisely how #52
+    made every render LoRA-free while still "working". This one starts from a
+    real ComfyUI-shaped file on disk: ``diffusion_model.`` prefix and
+    ``.to_out.0.``, both of which must be rewritten to land on the model.
+    """
+    from ltx_core_mlx.loader.runtime_loras import load_and_attach_loras
+
+    mx.random.seed(24)
+    model = _Tiny(blocks=1)
+    nn.quantize(model, group_size=GROUP_SIZE, bits=4)
+
+    path = tmp_path / "comfy_shaped.safetensors"
+    mx.save_safetensors(
+        str(path),
+        {
+            "diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight": mx.random.normal((4, 128)) * 0.01,
+            "diffusion_model.transformer_blocks.0.attn1.to_q.lora_B.weight": mx.random.normal((128, 4)) * 0.01,
+            # ComfyUI's Sequential spelling — must become `.to_out.`
+            "diffusion_model.transformer_blocks.0.attn1.to_out.0.lora_A.weight": mx.random.normal((4, 128)) * 0.01,
+            "diffusion_model.transformer_blocks.0.attn1.to_out.0.lora_B.weight": mx.random.normal((128, 4)) * 0.01,
+        },
+    )
+
+    report = load_and_attach_loras(model, [(str(path), 1.0)], verbose=False)
+    assert len(report.applied) == 2
+    assert not report.skipped
+    assert {module.name for module in report.applied} == {
+        "transformer_blocks.0.attn1.to_q",
+        "transformer_blocks.0.attn1.to_out",
+    }
+
+
 # ---------------------------------------------------------------------------
 # 3. Refusals — nothing may be dropped in silence
 # ---------------------------------------------------------------------------
