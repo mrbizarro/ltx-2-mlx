@@ -35,11 +35,11 @@ from ltx_core_mlx.utils.positions import (
     compute_video_positions,
 )
 
-from .scheduler import DISTILLED_SIGMAS, STAGE_2_SIGMAS
+from .scheduler import DISTILLED_SIGMAS, resolve_stage2_sigmas
 from .ti2vid_two_stages import TI2VidTwoStagesPipeline
 from .utils.helpers import create_noised_state
 from .utils.progress import phase
-from .utils.sampler_choice import resolve_diffusion_step
+from .utils.sampler_choice import model_version_of, resolve_diffusion_step
 from .utils.samplers import denoise_loop
 
 _materialize = getattr(mx, "eval")  # noqa: B009 -- security hook flags mx.eval pattern
@@ -282,7 +282,9 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
 
         # --- Stage 2: full resolution refine (no LoRA swap — already distilled) ---
         video_tokens, _ = self.video_patchifier.patchify(video_upscaled)
-        sigmas_2 = STAGE_2_SIGMAS[: stage2_steps + 1] if stage2_steps else STAGE_2_SIGMAS
+        # LTX-2.5 moves stage 2's first sigma 0.909375 -> 0.85 (official
+        # template, node 395). 2.3 gets its own list, unchanged.
+        sigmas_2 = resolve_stage2_sigmas(model_version_of(self.dit), stage2_steps)
         start_sigma = sigmas_2[0]
 
         video_positions_2 = compute_video_positions(F, H_full, W_full, frame_rate=frame_rate)

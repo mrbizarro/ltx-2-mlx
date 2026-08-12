@@ -321,3 +321,72 @@ def test_no_scale_is_resolved_with_a_falsy_or():
             if pattern.search(line) and not line.lstrip().startswith(("#", '"', "'")):
                 offenders.append(f"{path.name}:{lineno}: {line.strip()}")
     assert not offenders, "falsy-or on a scale that can legitimately be 0.0:\n" + "\n".join(offenders)
+
+
+# --------------------------------------------------------------------------- #
+# 6. the stage-2 schedule, pinned to the official template
+# --------------------------------------------------------------------------- #
+
+
+def test_stage1_sigmas_are_the_official_template_values_verbatim():
+    """Node 404 (`ManualSigmas`) of Comfy-Org/workflow_templates
+    `video_ltx2_5_t2v.json`, read from the raw JSON rather than from a summary.
+
+    Five of the nine points sit inside the top 2.5% of the noise range. No
+    naive shifted schedule reproduces that, so this is a table to copy, not a
+    formula to re-derive — and a table that is copied must be pinned."""
+    from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS
+
+    assert DISTILLED_SIGMAS == [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
+    assert sum(1 for s in DISTILLED_SIGMAS if s >= 0.975) == 5
+
+
+def test_stage2_sigmas_differ_between_generations_in_exactly_one_place():
+    """Node 395 of the same template: "0.85, 0.7250, 0.4219, 0.0".
+
+    0.4219 is 0.421875 shown at four decimals — display rounding, not a
+    different sigma. The FIRST value is the real change (0.909375 -> 0.85), and
+    the fact that it is the only one is what makes it deliberate."""
+    from ltx_pipelines_mlx.scheduler import STAGE_2_SIGMAS, STAGE_2_SIGMAS_LTX25
+
+    assert STAGE_2_SIGMAS_LTX25 == [0.85, 0.725, 0.421875, 0.0]
+    assert STAGE_2_SIGMAS == [0.909375, 0.725, 0.421875, 0.0]
+    differing = [i for i, (a, b) in enumerate(zip(STAGE_2_SIGMAS, STAGE_2_SIGMAS_LTX25)) if a != b]
+    assert differing == [0]
+    assert round(STAGE_2_SIGMAS_LTX25[2], 4) == 0.4219
+
+
+def test_stage2_resolution_is_version_keyed_and_defaults_to_23():
+    from ltx_pipelines_mlx.scheduler import STAGE_2_SIGMAS, STAGE_2_SIGMAS_LTX25, resolve_stage2_sigmas
+
+    assert resolve_stage2_sigmas((2, 3)) == STAGE_2_SIGMAS
+    assert resolve_stage2_sigmas((2, 5)) == STAGE_2_SIGMAS_LTX25
+    assert resolve_stage2_sigmas((2, 6)) == STAGE_2_SIGMAS_LTX25
+    # an unreadable checkpoint yields (), which must NOT opt into the new table
+    assert resolve_stage2_sigmas(()) == STAGE_2_SIGMAS
+
+
+def test_stage2_truncation_keeps_the_pre_existing_semantics():
+    """The old call site was ``STAGE_2_SIGMAS[: n + 1] if n else STAGE_2_SIGMAS``,
+    including the wart that a truncated schedule no longer ends at 0.0. Changing
+    that here would be a second behaviour change smuggled in under the first."""
+    from ltx_pipelines_mlx.scheduler import STAGE_2_SIGMAS, resolve_stage2_sigmas
+
+    for n in (None, 0, 1, 2, 3, 9):
+        expected = STAGE_2_SIGMAS[: n + 1] if n else STAGE_2_SIGMAS
+        assert resolve_stage2_sigmas((2, 3), n) == expected
+    assert resolve_stage2_sigmas((2, 5), 2) == [0.85, 0.725, 0.421875]  # no terminal 0.0, as before
+
+
+def test_audio_rate_25_is_tokens_per_second_not_a_video_frame_rate():
+    """Resolves the reported "docs say 24 fps, the template's audio latent
+    implies 25" discrepancy: the 25 is AUDIO LATENT TOKENS PER SECOND, derived
+    as 16000 / 160 / 4, and it is independent of the video frame rate. There is
+    no fps disagreement to reconcile — we ship 24 fps like 2.3, and the audio
+    token count for a 24 fps clip is not 24-shaped."""
+    from ltx_core_mlx.utils.positions import AUDIO_LATENTS_PER_SECOND, compute_audio_token_count
+
+    assert AUDIO_LATENTS_PER_SECOND == 25.0
+    # the official template's base latent is 97 frames; at 24 fps that is not 97 tokens
+    assert compute_audio_token_count(97, frame_rate=24.0) == 101
+    assert compute_audio_token_count(97, frame_rate=25.0) == 97

@@ -23,10 +23,10 @@ from ltx_core_mlx.components.patchifiers import (
 from ltx_core_mlx.model.transformer.model import X0Model
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
-from ltx_pipelines_mlx.scheduler import STAGE_2_SIGMAS, ltx2_schedule
+from ltx_pipelines_mlx.scheduler import ltx2_schedule, resolve_stage2_sigmas
 from ltx_pipelines_mlx.ti2vid_two_stages import DEFAULT_CFG_SCALE, TI2VidTwoStagesPipeline
 from ltx_pipelines_mlx.utils.helpers import create_noised_state
-from ltx_pipelines_mlx.utils.sampler_choice import resolve_diffusion_step
+from ltx_pipelines_mlx.utils.sampler_choice import model_version_of, resolve_diffusion_step
 from ltx_pipelines_mlx.utils.samplers import denoise_loop, res2s_denoise_loop
 
 # TeaCache calibration constants for the HQ res_2s path (LTX-2 stage 1, 30
@@ -282,7 +282,9 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
         # --- Stage 2: Refine at full resolution (no CFG) ---
         video_tokens, _ = self.video_patchifier.patchify(video_upscaled)
 
-        sigmas_2 = STAGE_2_SIGMAS[: stage2_steps + 1] if stage2_steps else STAGE_2_SIGMAS
+        # LTX-2.5 moves stage 2's first sigma 0.909375 -> 0.85 (official
+        # template, node 395). 2.3 gets its own list, unchanged.
+        sigmas_2 = resolve_stage2_sigmas(model_version_of(self.dit), stage2_steps)
         start_sigma = sigmas_2[0]
 
         video_positions_2 = compute_video_positions(F, H_full, W_full, frame_rate=frame_rate)
