@@ -321,7 +321,43 @@ def _logical_in_features(module: nn.Module) -> int:
     return int(module["weight"].shape[-1])
 
 
+def _compute_dtype(base: nn.Module) -> mx.Dtype:
+    """The dtype the layer computes in.
+
+    A ``QuantizedLinear``'s ``weight`` is packed ``uint32``; its ``scales`` carry
+    the real precision (bfloat16 on every LTX pack we ship).
+    """
+    if isinstance(base, nn.QuantizedLinear):
+        return base["scales"].dtype
+    return base["weight"].dtype
+
+
+def _match_dtype(a: mx.array, b: mx.array, base: nn.Module) -> tuple[mx.array, mx.array]:
+    """Narrow the adapters to the layer's compute dtype. Never widen.
+
+    LoRA files are often float32 — ``bizarrotrn_v2`` is, 856 MB of it — while the
+    forward runs in bfloat16. Holding fp32 adapters against a bf16 layer buys
+    nothing and costs three things: double the resident memory, fp32 matmuls for
+    the low-rank hops, and the mixed-dtype fallback instead of the fused
+    :func:`mlx.core.addmm` epilogue. Measured at 4096 wide, rank 32, 9216 tokens:
+    **+9.7 % wall clock as fp32 vs +2.7 % narrowed**, and 856 MB vs 428 MB.
+
+    What it costs in accuracy: the delta's own relative error goes from 0.17 %
+    (fp32 hops, rounded once on the add) to 0.33 % — which is 0.02 % of the
+    layer's output, and still **6x better than fusing into bf16** (2.1 %) and
+    ~280x better than fusing into int4 (94 %). Widening is never done: a bf16
+    adapter on an fp32 layer would only waste memory.
+    """
+    dtype = _compute_dtype(base)
+    if a.dtype.size > dtype.size:
+        a = a.astype(dtype)
+    if b.dtype.size > dtype.size:
+        b = b.astype(dtype)
+    return a, b
+
+
 def _wrap(base: nn.Module, a: mx.array, b: mx.array, scale: float) -> nn.Module:
+    a, b = _match_dtype(a, b, base)
     if isinstance(base, nn.QuantizedLinear):
         return LoRAQuantizedLinear(base, a, b, scale)
     return LoRALinear(base, a, b, scale)

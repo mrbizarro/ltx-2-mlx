@@ -82,7 +82,10 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument(
-        "--depth", type=int, default=48, help="Dependent applications per timed graph (default: 48, the DiT's block count)"
+        "--depth",
+        type=int,
+        default=48,
+        help="Dependent applications per timed graph (default: 48, the DiT's block count)",
     )
     args = parser.parse_args()
 

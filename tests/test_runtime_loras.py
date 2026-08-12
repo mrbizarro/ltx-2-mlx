@@ -169,6 +169,57 @@ def test_measured_delta_survival_unfused_beats_bf16_fusion_beats_quantized_fusio
         assert quantized_lost > 2 * bf16_lost
 
 
+def test_adapters_are_narrowed_to_the_layers_compute_dtype_and_stay_accurate():
+    """An fp32 LoRA on a bf16 layer is narrowed — and the delta still survives.
+
+    ``bizarrotrn_v2`` ships as float32 (856 MB). Against a bfloat16 pack that is
+    double the memory, fp32 matmuls for the low-rank hops, and no fused addmm
+    epilogue, for accuracy the forward cannot use. What the narrowing costs is
+    bounded here: the delta's relative error must stay far below what fusing
+    into bf16 (2.1 %) would have cost, let alone int4 (94 %).
+    """
+    mx.random.seed(23)
+    in_features, out_features, rank = 512, 512, 32
+    linear = nn.Linear(in_features, out_features, bias=False)
+    linear.weight = linear.weight.astype(mx.bfloat16)
+    quantized = nn.QuantizedLinear.from_linear(linear, group_size=GROUP_SIZE, bits=4)
+    assert quantized["scales"].dtype == mx.bfloat16
+
+    effective = mx.dequantize(
+        quantized["weight"],
+        scales=quantized["scales"],
+        biases=quantized.get("biases"),
+        group_size=GROUP_SIZE,
+        bits=4,
+    ).astype(mx.float32)
+    a, b = _lora_pair(in_features, out_features, rank, effective)
+    adapter = LoRAQuantizedLinear(*_narrowed(quantized, a, b), 1.0)
+
+    assert adapter["lora_a"].dtype == mx.bfloat16
+    assert adapter["lora_b"].dtype == mx.bfloat16
+
+    x = mx.random.normal((8, in_features)).astype(mx.bfloat16)
+    want = x.astype(mx.float32) @ (b @ a).astype(mx.float32).T
+
+    # The delta the narrowed adapter actually contributes, straight from its own
+    # arrays — not recovered by differencing two bfloat16 outputs, which would
+    # amplify the layer's rounding by |y|/|delta| (~12x here) and measure the
+    # subtraction rather than the adapter.
+    narrowed_delta = ((x @ adapter["lora_a"].T) @ adapter["lora_b"].T).astype(mx.float32)
+    assert _rel(narrowed_delta, want) < 0.01, "narrowing must cost far less than any fusion would"
+
+    # And as a share of what the layer outputs, which is what a render sees.
+    y = adapter(x).astype(mx.float32)
+    assert _norm(narrowed_delta - want) / _norm(y) < 1e-3
+
+
+def _narrowed(base, a, b):
+    """``(base, a, b)`` with the adapters narrowed exactly as ``attach_loras`` does."""
+    from ltx_core_mlx.loader.runtime_loras import _match_dtype
+
+    return (base, *_match_dtype(a, b, base))
+
+
 def test_zero_strength_is_a_strict_no_op():
     """A zero-strength LoRA must be bit-identical to no LoRA at all."""
     mx.random.seed(14)
