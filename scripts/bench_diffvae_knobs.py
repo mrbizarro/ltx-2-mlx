@@ -213,6 +213,12 @@ def main(argv=None) -> int:
     ap.add_argument("--pixels", type=Path, help="save the raw uint8 (F,H,W,3) array")
     ap.add_argument("--json", required=True, type=Path)
     ap.add_argument("--label", default="")
+    ap.add_argument(
+        "--compare",
+        type=Path,
+        help="reference (F,H,W,3) uint8 npy: report the hash match and, when it does not "
+        "match, how far apart the two pixel arrays actually are",
+    )
     args = ap.parse_args(argv)
 
     if not args.diffusion_pack and not args.conv_pack:
@@ -270,6 +276,20 @@ def main(argv=None) -> int:
 
     if prof is not None:
         out["profile"] = prof.report()
+    if args.compare:
+        ref = np.load(args.compare)
+        same = hashlib.sha256(ref.tobytes()).hexdigest() == out["pixels_sha256"]
+        cmp_out = {"reference": str(args.compare), "sha256_match": same}
+        if not same and ref.shape == rgb.shape:
+            diff = np.abs(ref.astype(np.int16) - rgb.astype(np.int16))
+            mse = float(np.mean(diff.astype(np.float64) ** 2))
+            cmp_out.update(
+                mean_abs_diff_255=round(float(diff.mean()), 4),
+                max_abs_diff_255=int(diff.max()),
+                changed_pixel_fraction=round(float((diff > 0).mean()), 6),
+                psnr_db=round(float(10 * np.log10(255**2 / mse)), 2) if mse else None,
+            )
+        out["compare"] = cmp_out
     if args.pixels:
         np.save(args.pixels, rgb)
     if args.video:
