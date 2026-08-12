@@ -119,7 +119,10 @@ class LoRAQuantizedLinear(nn.QuantizedLinear):
         nn.Module.__init__(self)
         self.group_size = base.group_size
         self.bits = base.bits
-        self.mode = getattr(base, "mode", "affine")
+        # `or "affine"` rather than a getattr default: MLX's Module.__getattr__
+        # returns None for a missing key instead of raising, so the default
+        # would never be reached and `mode=None` would reach quantized_matmul.
+        self.mode = getattr(base, "mode", None) or "affine"
         self.weight = base["weight"]
         self.scales = base["scales"]
         biases = base.get("biases")

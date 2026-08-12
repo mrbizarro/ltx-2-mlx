@@ -33,6 +33,7 @@ hundred MB) + mmap metadata (~50 MB) ≈ ~1 GB.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -77,6 +78,18 @@ class BlockLoraSource:
         self._lora_path = str(lora_path)
         self._sd_ops = sd_ops
         self._lora_data = mx.load(self._lora_path)
+        # Said once, here, because the fusion itself runs 48x per forward and
+        # cannot say it. Bind-time fusion is weight fusion: on a quantized pack
+        # it destroys most of the delta (~94 % at int4, ~10 % at int8). The
+        # unfused runtime branch is the fix, and it is not available under block
+        # streaming — see ltx_core_mlx.loader.runtime_loras.
+        print(
+            f"NOTE: {Path(self._lora_path).name} will be FUSED into the streamed blocks at "
+            "bind time. On a quantized pack that costs most of the LoRA delta (~94 % at "
+            "int4). Drop --low-ram to get the exact unfused branch.",
+            file=sys.stderr,
+            flush=True,
+        )
 
         # block_idx -> param_name -> {"a": full_key, "b": full_key}
         self._block_keys: dict[int, dict[str, dict[str, str]]] = {}
@@ -267,7 +280,12 @@ class BlockStreamer:
         if not lora_sd_and_strengths:
             return weights
 
-        fused = apply_loras(block_sd, lora_sd_and_strengths)
+        # quantized_ok + verbose=False: this runs once per block per forward —
+        # 48x per step. The per-call count line would drown the log and the
+        # quantized-fusion probe would re-measure the same thing thousands of
+        # times. The warning is emitted once, at attach time, by
+        # BlockLoraSource.__init__ instead.
+        fused = apply_loras(block_sd, lora_sd_and_strengths, quantized_ok=True, verbose=False)
         return list(fused.sd.items())
 
     def _reload_dict(self) -> dict[str, mx.array]:
