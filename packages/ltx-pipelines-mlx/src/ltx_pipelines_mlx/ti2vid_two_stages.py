@@ -36,7 +36,11 @@ from ltx_pipelines_mlx._base import BasePipeline
 from ltx_pipelines_mlx.scheduler import ltx2_schedule, resolve_stage2_sigmas
 from ltx_pipelines_mlx.utils.helpers import create_noised_state
 from ltx_pipelines_mlx.utils.sampler_choice import model_version_of, resolve_diffusion_step
-from ltx_pipelines_mlx.utils.samplers import denoise_loop, guided_denoise_loop
+from ltx_pipelines_mlx.utils.samplers import (
+    denoise_loop,
+    euler_loop_estimates,
+    guided_denoise_loop,
+)
 
 # Reference defaults
 DEFAULT_CFG_SCALE = 3.0
@@ -326,6 +330,7 @@ class TI2VidTwoStagesPipeline(BasePipeline):
         enable_teacache: bool = False,
         teacache_thresh: float | None = None,
         tap: callable | None = None,
+        live_preview=None,
     ) -> tuple[mx.array, mx.array]:
         """Generate video using two-stage pipeline.
 
@@ -438,6 +443,16 @@ class TI2VidTwoStagesPipeline(BasePipeline):
         num_tokens = F * H_half * W_half
         sigmas_1 = ltx2_schedule(stage1_steps, num_tokens=num_tokens)
 
+        if live_preview is not None:
+            # Stage 1 is half-res, so its thumbnails are a half-res composition monitor.
+            live_preview.plan(
+                [
+                    ("stage1", euler_loop_estimates(sigmas_1)),
+                    ("stage2", euler_loop_estimates(resolve_stage2_sigmas(model_version_of(self.dit), stage2_steps))),
+                ]
+            )
+            live_preview.start_stage("stage1", latent_frames=F, latent_height=H_half, latent_width=W_half)
+
         # Optional modality tiling: split video tokens into spatial/temporal
         # tiles for memory savings on long videos. Audio is replicated
         # across tiles. Composes with low_ram_streaming.
@@ -490,6 +505,7 @@ class TI2VidTwoStagesPipeline(BasePipeline):
             teacache=teacache_controller,
             tap=tap,
             diffusion_step=resolve_diffusion_step(self.dit),
+            preview=live_preview,
         )
         if self.low_memory:
             aggressive_cleanup()
@@ -583,6 +599,9 @@ class TI2VidTwoStagesPipeline(BasePipeline):
             tiler_2 = VideoModalityTiler(self._tile_count, latent_shape=(F, H_full, W_full))
             stage2_x0_model = X0Model(TiledLTXModel(self.dit, tiler_2))
 
+        if live_preview is not None:
+            live_preview.start_stage("stage2", latent_frames=F, latent_height=H_full, latent_width=W_full)
+
         self._pre_denoise_flush(video_state_2, audio_state_2)
         output_2 = denoise_loop(
             model=stage2_x0_model,
@@ -593,6 +612,7 @@ class TI2VidTwoStagesPipeline(BasePipeline):
             sigmas=sigmas_2,
             video_cross_attention_mask=relay_mask(F, H_full, W_full, video_state_2.latent.shape[1]),
             diffusion_step=resolve_diffusion_step(self.dit),
+            preview=live_preview,
         )
         if self.low_memory:
             aggressive_cleanup()
@@ -627,6 +647,7 @@ class TI2VidTwoStagesPipeline(BasePipeline):
         enable_teacache: bool = False,
         teacache_thresh: float | None = None,
         prompt_relay=None,
+        live_preview=None,
     ) -> str:
         """Generate two-stage video+audio and save to file.
 
@@ -670,6 +691,8 @@ class TI2VidTwoStagesPipeline(BasePipeline):
             gen_kwargs["stage2_sigmas"] = stage2_sigmas
         if schedule_preset is not None:
             gen_kwargs["schedule_preset"] = schedule_preset
+        if live_preview is not None:
+            gen_kwargs["live_preview"] = live_preview
         video_latent, audio_latent = self.generate_two_stage(**gen_kwargs)
 
         # Free transformer + encoder to make room for decoders

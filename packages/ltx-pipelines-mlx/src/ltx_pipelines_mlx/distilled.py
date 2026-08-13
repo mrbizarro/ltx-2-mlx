@@ -46,7 +46,7 @@ from .ti2vid_two_stages import TI2VidTwoStagesPipeline
 from .utils.helpers import create_noised_state
 from .utils.progress import phase
 from .utils.sampler_choice import model_version_of, resolve_diffusion_step
-from .utils.samplers import denoise_loop
+from .utils.samplers import denoise_loop, euler_loop_estimates
 
 _materialize = getattr(mx, "eval")  # noqa: B009 -- security hook flags mx.eval pattern
 
@@ -132,6 +132,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         image: str | None = None,
         images=None,
         prompt_relay=None,
+        live_preview=None,
         **_unused_kwargs,
     ) -> tuple[mx.array, mx.array]:
         """Generate video using the distilled two-stage pipeline.
@@ -255,6 +256,23 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             legacy_scalar_blend=True,
         )
 
+        if live_preview is not None:
+            # Both schedules were resolved together above, before any GPU was
+            # spent, so the preview's total (and its ETA) is right from the
+            # first thumbnail. Deliberately reuses `sigmas_1` / `sigmas_2`
+            # rather than re-deriving them: a step count thins the checkpoint's
+            # table through `resolve_distilled_schedule`, and a second
+            # derivation here would be a second place for that to drift.
+            live_preview.plan(
+                [
+                    ("stage1", euler_loop_estimates(sigmas_1)),
+                    ("stage2", euler_loop_estimates(sigmas_2)),
+                ]
+            )
+            live_preview.start_stage(
+                "stage1", latent_frames=F, latent_height=H_half, latent_width=W_half
+            )
+
         stage1_dit = self.dit
         if self._tile_count is not None:
             from ltx_core_mlx.components.modality_tiling import TiledLTXModel, VideoModalityTiler
@@ -275,6 +293,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             video_cross_attention_mask=relay_mask(F, H_half, W_half, video_state.latent.shape[1]),
             # LTX-2.5 samples stage 1 ancestrally; 2.3 gets None -> plain Euler.
             diffusion_step=resolve_diffusion_step(self.dit),
+            preview=live_preview,
         )
         if self.low_memory:
             aggressive_cleanup()
@@ -352,6 +371,9 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             tiler_2 = VideoModalityTiler(self._tile_count, latent_shape=(F, H_full, W_full))
             stage2_x0_model = X0Model(TiledLTXModel(self.dit, tiler_2))
 
+        if live_preview is not None:
+            live_preview.start_stage("stage2", latent_frames=F, latent_height=H_full, latent_width=W_full)
+
         self._pre_denoise_flush(video_state_2, audio_state_2)
         output_2 = denoise_loop(
             model=stage2_x0_model,
@@ -362,6 +384,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             sigmas=sigmas_2,
             video_cross_attention_mask=relay_mask(F, H_full, W_full, video_state_2.latent.shape[1]),
             diffusion_step=resolve_diffusion_step(self.dit),
+            preview=live_preview,
         )
         if self.low_memory:
             aggressive_cleanup()

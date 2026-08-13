@@ -27,7 +27,12 @@ from ltx_pipelines_mlx.scheduler import ltx2_schedule, resolve_stage2_sigmas
 from ltx_pipelines_mlx.ti2vid_two_stages import DEFAULT_CFG_SCALE, TI2VidTwoStagesPipeline
 from ltx_pipelines_mlx.utils.helpers import create_noised_state
 from ltx_pipelines_mlx.utils.sampler_choice import model_version_of, resolve_diffusion_step
-from ltx_pipelines_mlx.utils.samplers import denoise_loop, res2s_denoise_loop
+from ltx_pipelines_mlx.utils.samplers import (
+    denoise_loop,
+    euler_loop_estimates,
+    res2s_denoise_loop,
+    res2s_loop_estimates,
+)
 
 # TeaCache calibration constants for the HQ res_2s path (LTX-2 stage 1, 30
 # steps, 384x576x65 reference shape, MLX bf16 q8). Calibrated 2026-04-27 from
@@ -211,6 +216,7 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
         enable_teacache: bool = False,
         teacache_thresh: float | None = None,
         tap: callable | None = None,
+        live_preview=None,
     ) -> tuple[mx.array, mx.array]:
         """Generate video using HQ two-stage pipeline with res_2s sampler.
 
@@ -299,6 +305,21 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
         sigmas_1 = ltx2_schedule(stage1_steps, num_tokens=num_tokens)
         x0_model = X0Model(self.dit)
 
+        if live_preview is not None:
+            # Stage 1 runs at HALF resolution, so its previews are a half-res composition
+            # monitor — which is what you want from a monitor, and cheaper. Stage 2's are
+            # full-res, so the owner sees the refine land.
+            # res_2s is second-order: 2 estimates per step, +1 for the terminal denoise.
+            # ``resolve_stage2_sigmas`` is pure and is called again below for the real
+            # stage-2 run — this call decides nothing, it only sizes the progress total.
+            live_preview.plan(
+                [
+                    ("stage1", res2s_loop_estimates(sigmas_1)),
+                    ("stage2", euler_loop_estimates(resolve_stage2_sigmas(model_version_of(self.dit), stage2_steps))),
+                ]
+            )
+            live_preview.start_stage("stage1", latent_frames=F, latent_height=H_half, latent_width=W_half)
+
         # Build guider params (HQ defaults: no STG, lower rescale).
         #
         # ``modality_scale`` is keyed by the checkpoint's generation, exactly as
@@ -335,6 +356,7 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
             video_cross_attention_mask=relay_mask(F, H_half, W_half, video_state.latent.shape[1]),
             teacache=teacache_controller,
             tap=tap,
+            preview=live_preview,
         )
         if self.low_memory:
             aggressive_cleanup()
@@ -417,6 +439,9 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
         )
 
         # Stage 2: simple denoising (no CFG)
+        if live_preview is not None:
+            live_preview.start_stage("stage2", latent_frames=F, latent_height=H_full, latent_width=W_full)
+
         self._pre_denoise_flush(video_state_2, audio_state_2)
         output_2 = denoise_loop(
             model=x0_model,
@@ -429,6 +454,7 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
             # Stage 1 above is res_2s (its own stochastic sampler, untouched);
             # this refine pass is the Euler one the 2.5 templates replace.
             diffusion_step=resolve_diffusion_step(self.dit),
+            preview=live_preview,
         )
         if self.low_memory:
             aggressive_cleanup()

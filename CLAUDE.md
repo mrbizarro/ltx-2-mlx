@@ -825,6 +825,107 @@ LTX-2 stage 1 has weak per-step input/output L1 correlation (Pearson 0.41) and h
 
 ---
 
+## Live preview + early abort (`--live-preview`)
+
+Opt-in, default off, **lossless**. After every x0 estimate the denoise loop already computes,
+a 22 MB tiny decoder turns one latent frame into a PNG on disk, so a bad take can be stopped
+in the first thirty seconds instead of the last. Ported from the proven MiniMax-H3 feature;
+the file contract is the same one with an LTX schema id.
+
+```bash
+ltx-2-mlx generate --two-stages-hq -p "..." -o out.mp4 --frame-rate 24 \
+  --live-preview tae --live-preview-tae /path/to/taeltx2_3.safetensors
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--live-preview {off,tae}` | `off` | On `--distilled` / `--two-stage` / `--two-stages-hq` |
+| `--live-preview-tae PATH` | `$LTX2_TAE_CHECKPOINT` | madebyollin `taeltx2_3.safetensors` (MIT, ~22 MB) |
+| `--live-preview-dir DIR` | `<output dir>/live` | Where the contract below lives |
+| `--live-preview-every N` | 1 | Publish every Nth estimate (the last of each stage always publishes) |
+| `--live-preview-latent-frame I` | middle | Which latent frame to preview |
+| `--live-preview-context K` | 2 | Causal warm-up frames for the tiny decoder |
+| `--live-preview-downscale N` | 0 (auto) | 1 = full-res thumbnail; auto pools above 400 latent cells |
+
+### Why it is read-only, and therefore lossless
+
+LTX's denoisers wrap an `X0Model`, so the x0 estimate **is a tensor the loop already holds**
+— `denoised_v1` / `denoised_v2` in `res2s_denoise_loop`, `video_x0` in `denoise_loop` and
+`guided_denoise_loop`. The monitor slices one latent frame out of it and decodes; it draws no
+random numbers, calls no scheduler, and rebinds nothing. Gated by a byte-identity A/B (video
+elementary stream + audio + container `sha256`) on both call sites.
+
+**A "forward" in the contract is one x0 estimate, not one DiT pass.** res_2s is second-order
+(2 estimates per outer step, +1 terminal) and CFG adds an unconditional DiT pass to each, so
+the High tier's Stage 1 publishes `2 * steps + 1` previews off ~`4 * steps` DiT forwards.
+`utils/samplers.py::euler_loop_estimates` / `res2s_loop_estimates` are the counters; never
+derive them.
+
+### File contract (`ltx-live-preview/1`)
+
+```
+<live-dir>/
+  status.json                 # rewritten atomically after every estimate — poll THIS
+  preview_01.png … NN.png     # one per published estimate
+  preview_latest.png          # stable path, always == the newest preview_NN.png
+  history.jsonl               # advisory: one line per preview (stage, sigma, frame)
+  ABORT                       # YOU create this file to stop the render
+```
+
+Every file is written to `<name>.tmp<pid>`, `fsync`ed, then `os.replace`d, so a watcher polling
+at any frequency sees the previous complete file or the next one, never a torn one.
+`status.json` carries `schema`, `status`, `aborted`, `forward`/`total_forwards`,
+`stage`/`stage_index`/`total_stages`, `sigma`, `preview*`, `latent_frame`,
+`approx_output_frame`, `eta_seconds` (denoise only — add the VAE decode + mux),
+`preview_overhead_seconds` and `abort_sentinel`.
+
+**Abort:** `touch <live-dir>/ABORT`. The loops check between estimates, consume the sentinel
+(so it cannot kill the next render), write `"status": "aborted"`, and **exit 75** — distinct
+from 0 (done) and 1 (traceback), so a supervisor tells a cancel from a crash without parsing
+anything. No mp4, wav or frames directory is left behind; the abort lands during denoise,
+before any encode. A sentinel already present at start-up is treated as stale and deleted
+(`stale_abort_cleared: true`).
+
+### Measured (2026-08-12, MLX 0.31.1, M4 Max)
+
+- **Lossless on both call sites.** Video elementary stream, decoded audio and container
+  `sha256` identical off vs on, for `denoise_loop` (q8 distilled draft) and for
+  `res2s_denoise_loop` (`--two-stages-hq`, dev + fused distilled LoRA).
+- **0.22 % of wall at the High tier** — 0.674 s over 24 previews on a 305 s render; 0.60 % at
+  the draft tier. Peak memory +0.23 GB RSS, i.e. inside the noise.
+- **Context 2 is indistinguishable from decoding the whole clip** (0.42/255, correlation
+  0.99999) at 27 ms. Context 0 is visibly ghosted. `context >= latent_frame` is bit-exact.
+- **The composition is settled at estimate 2 of 24** on the HQ path (correlation 0.962, 53.7 s
+  into a 305 s render). On the **distilled** path it is estimate **6 of 8** — `DISTILLED_SIGMAS`
+  puts five of its nine points at >= 0.975, so the early thumbnails are still noise.
+- **On the HQ path, prefer `--live-preview-every 2`.** res_2s's odd (anchor) estimates are
+  evaluated just after step-level SDE noise injection and come back visibly patchier than its
+  even (substep) ones until ~estimate 8. `forward % 2 == 0` selects exactly the substeps, so the
+  picture stops flickering and the cost halves.
+
+### Honest limits
+
+- **It is a composition monitor, not a face monitor.** The tiny decoder is soft by design and
+  at 1024x576 Stage 2 the thumbnail is pooled to half. It answers "is this the right shot?",
+  never "is this face clean?".
+- One latent frame, not a clip: it says nothing about motion and nothing about audio.
+- Abort latency is one estimate. Checking mid-forward would mean reaching inside the DiT.
+- Stage 1 of a two-stage render is **half resolution**, so its previews are half-res. That is
+  what you want from a monitor, and it is cheaper.
+
+### Key files
+
+- `live_preview.py` — `LivePreviewMonitor`, the schema, the atomic writes, the sentinel.
+- `tiny_video_vae.py` — decode-only MLX port of madebyollin `taeltx2_3` (MIT). `taeltx2_3` was
+  trained on LTX-**2.3** latents and is valid on 2.5 because the two packs' conv VAEs are
+  byte-identical tensor for tensor (86/86, encoder and decoder).
+- `utils/samplers.py` — the `preview=` hook on all three denoise loops.
+- `tests/test_live_preview.py` — the offline contract gate.
+- `scripts/probe_preview_context.py`, `live_preview_ab.sh`, `live_preview_abort_test.sh`,
+  `live_preview_strip.py` — falsification, hash proof, abort proof, evidence strip.
+
+---
+
 ## IC-LoRA Pipeline
 
 Two-stage pipeline for control-conditioned video generation using official Lightricks IC-LoRAs.
