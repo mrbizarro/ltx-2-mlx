@@ -254,6 +254,39 @@ def denoise_loop(
             video_x = _ancestral_step(diffusion_step, video_x, video_x0, sigma_schedule, step_index)
             audio_x = _ancestral_step(diffusion_step, audio_x, audio_x0, sigma_schedule, step_index)
 
+        # RE-PIN THE SAMPLE, NOT JUST THE x0 ESTIMATE.
+        #
+        # The masked tokens (i2v's frame 0, and any conditioning frame) are
+        # already forced into `x0` above. Under EULER that was sufficient by
+        # arithmetic accident: velocity = (x - x0)/sigma is exactly 0 at a
+        # pinned token, so the step returns it unchanged and the anchor holds.
+        #
+        # The ANCESTRAL step has no such property. It rescales EVERY token by
+        # alpha_next/alpha_down and adds fresh Gaussian noise, unmasked — so a
+        # pinned frame-0 latent is attenuated and re-noised on every
+        # intermediate step (measured: halved and buried under noise 0.86x its
+        # own scale after step 1). Every forward from step 2 on then sees
+        # garbage where the conditioning image should be, and the composition
+        # is decided without it. The terminal step (sigma_next == 0) returns
+        # `denoised` and stamps the image back in, which is why the delivered
+        # frame 0 matched the input while the clip was a different shot
+        # entirely — the owner-reported "kept the character and style, new
+        # composition".
+        #
+        # ComfyUI's 2.5 i2v graph re-composites the masked region into the
+        # sample before every model call; this port implemented only the x0
+        # half of that. This is the other half.
+        #
+        # Guarded by the uniform-mask flags, so t2v (mask all ones) is
+        # untouched and byte-identical, as is every Euler lane — keyframe/flf2v
+        # included, which pins eta to 0 deliberately and never reaches here.
+        if not video_uniform:
+            video_x = apply_denoise_mask(
+                video_x, video_state.clean_latent, video_state.denoise_mask)
+        if not audio_uniform:
+            audio_x = apply_denoise_mask(
+                audio_x, audio_state.clean_latent, audio_state.denoise_mask)
+
         # Force computation for memory efficiency
         mx.async_eval(video_x, audio_x)
 
@@ -837,6 +870,39 @@ def guided_denoise_loop(
             else:
                 video_x = _ancestral_step(diffusion_step, video_x, last_video_x0, sigma_schedule, step_idx)
                 audio_x = _ancestral_step(diffusion_step, audio_x, last_audio_x0, sigma_schedule, step_idx)
+
+            # RE-PIN THE SAMPLE, NOT JUST THE x0 ESTIMATE.
+            #
+            # The masked tokens (i2v's frame 0, and any conditioning frame) are
+            # already forced into `x0` above. Under EULER that was sufficient by
+            # arithmetic accident: velocity = (x - x0)/sigma is exactly 0 at a
+            # pinned token, so the step returns it unchanged and the anchor holds.
+            #
+            # The ANCESTRAL step has no such property. It rescales EVERY token by
+            # alpha_next/alpha_down and adds fresh Gaussian noise, unmasked — so a
+            # pinned frame-0 latent is attenuated and re-noised on every
+            # intermediate step (measured: halved and buried under noise 0.86x its
+            # own scale after step 1). Every forward from step 2 on then sees
+            # garbage where the conditioning image should be, and the composition
+            # is decided without it. The terminal step (sigma_next == 0) returns
+            # `denoised` and stamps the image back in, which is why the delivered
+            # frame 0 matched the input while the clip was a different shot
+            # entirely — the owner-reported "kept the character and style, new
+            # composition".
+            #
+            # ComfyUI's 2.5 i2v graph re-composites the masked region into the
+            # sample before every model call; this port implemented only the x0
+            # half of that. This is the other half.
+            #
+            # Guarded by the uniform-mask flags, so t2v (mask all ones) is
+            # untouched and byte-identical, as is every Euler lane — keyframe/flf2v
+            # included, which pins eta to 0 deliberately and never reaches here.
+            if not video_uniform:
+                video_x = apply_denoise_mask(
+                    video_x, video_state.clean_latent, video_state.denoise_mask)
+            if not audio_uniform:
+                audio_x = apply_denoise_mask(
+                    audio_x, audio_state.clean_latent, audio_state.denoise_mask)
             mx.async_eval(video_x, audio_x)
             continue
 
@@ -1029,6 +1095,39 @@ def guided_denoise_loop(
         else:
             video_x = _ancestral_step(diffusion_step, video_x, video_x0, sigma_schedule, step_idx)
             audio_x = _ancestral_step(diffusion_step, audio_x, audio_x0, sigma_schedule, step_idx)
+
+        # RE-PIN THE SAMPLE, NOT JUST THE x0 ESTIMATE.
+        #
+        # The masked tokens (i2v's frame 0, and any conditioning frame) are
+        # already forced into `x0` above. Under EULER that was sufficient by
+        # arithmetic accident: velocity = (x - x0)/sigma is exactly 0 at a
+        # pinned token, so the step returns it unchanged and the anchor holds.
+        #
+        # The ANCESTRAL step has no such property. It rescales EVERY token by
+        # alpha_next/alpha_down and adds fresh Gaussian noise, unmasked — so a
+        # pinned frame-0 latent is attenuated and re-noised on every
+        # intermediate step (measured: halved and buried under noise 0.86x its
+        # own scale after step 1). Every forward from step 2 on then sees
+        # garbage where the conditioning image should be, and the composition
+        # is decided without it. The terminal step (sigma_next == 0) returns
+        # `denoised` and stamps the image back in, which is why the delivered
+        # frame 0 matched the input while the clip was a different shot
+        # entirely — the owner-reported "kept the character and style, new
+        # composition".
+        #
+        # ComfyUI's 2.5 i2v graph re-composites the masked region into the
+        # sample before every model call; this port implemented only the x0
+        # half of that. This is the other half.
+        #
+        # Guarded by the uniform-mask flags, so t2v (mask all ones) is
+        # untouched and byte-identical, as is every Euler lane — keyframe/flf2v
+        # included, which pins eta to 0 deliberately and never reaches here.
+        if not video_uniform:
+            video_x = apply_denoise_mask(
+                video_x, video_state.clean_latent, video_state.denoise_mask)
+        if not audio_uniform:
+            audio_x = apply_denoise_mask(
+                audio_x, audio_state.clean_latent, audio_state.denoise_mask)
 
         # Force computation for memory efficiency
         mx.async_eval(video_x, audio_x)
