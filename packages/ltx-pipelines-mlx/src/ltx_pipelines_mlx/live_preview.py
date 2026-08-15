@@ -51,6 +51,15 @@ ABORT_FILENAME = "ABORT"
 STATUS_FILENAME = "status.json"
 LATEST_FILENAME = "preview_latest.png"
 
+#: The animated companion to LATEST_FILENAME: the warm-up frames this decode already
+#: produced, written as one looping WebP. Same decode, so it costs no GPU.
+LOOP_FILENAME = "preview_latest.webp"
+#: Milliseconds per loop frame. The decoder emits eight pixel frames per latent token
+#: at 24 fps, so ~42 ms plays them back at the rate they were generated at.
+LOOP_FRAME_MS = 42
+#: A monitor, not a deliverable — trade bytes and encode time for fidelity.
+LOOP_QUALITY = 60
+
 #: Append-only log, one compact JSON object per published preview. ``status.json`` is the
 #: contract a panel polls; this is the record an *analysis* wants afterwards (which sigma and
 #: which stage produced ``preview_07.png``), and it is what ``scripts/live_preview_strip.py``
@@ -162,6 +171,8 @@ class LivePreviewMonitor:
         self.abort_path = self.directory / ABORT_FILENAME
         self.status_path = self.directory / STATUS_FILENAME
         self.latest_path = self.directory / LATEST_FILENAME
+        self.loop_path = self.directory / LOOP_FILENAME
+        self._loop_frames = 0
         self.history_path = self.directory / HISTORY_FILENAME
 
         self.output = Path(output)
@@ -320,7 +331,8 @@ class LivePreviewMonitor:
         index = local_output_index(context)
         decoded = self.tae.decode(latents, index + 1)
         mx.eval(decoded)
-        frame = np.array(decoded)[0, :, index].transpose(1, 2, 0)
+        stack = np.array(decoded)[0]  # (C, T, H, W)
+        frame = stack[:, index].transpose(1, 2, 0)
         image = (np.clip(frame, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
 
         from PIL import Image
@@ -333,6 +345,42 @@ class LivePreviewMonitor:
         _atomic_write(path, payload)
         _atomic_write(self.latest_path, payload)
         self._last_preview = path
+
+        # THE LOOP IS ALREADY DECODED — and on this lane it is bigger than
+        # H3's. ``context`` tokens of causal warm-up exist so the previewed
+        # frame does not open the clip (DEFAULT_CONTEXT above), and this
+        # decoder emits EIGHT pixel frames per latent token, so the call above
+        # produced ``8 * context + 1`` frames — seventeen at the shipped
+        # context — of which the line above used exactly one and dropped
+        # sixteen. They are the moments immediately before the previewed one,
+        # in order: real motion, already computed, for no extra GPU.
+        #
+        # Written as one animated WebP beside the PNG. A browser loops an
+        # animated WebP by itself, so the consumer needs no player and no
+        # timer; the PNG is untouched, so every existing consumer keeps its
+        # still. Announced in status.json rather than assumed.
+        if stack.shape[1] > 1:
+            try:
+                seq = np.clip(stack.transpose(1, 2, 3, 0), 0.0, 1.0)
+                seq = (seq * 255.0 + 0.5).astype(np.uint8)
+                frames = [Image.fromarray(f) for f in seq]
+                loop_buffer = io.BytesIO()
+                frames[0].save(
+                    loop_buffer,
+                    format="WEBP",
+                    save_all=True,
+                    append_images=frames[1:],
+                    duration=LOOP_FRAME_MS,
+                    loop=0,
+                    quality=LOOP_QUALITY,
+                    method=0,  # fastest setting: this is a monitor, not a deliverable
+                )
+                _atomic_write(self.loop_path, loop_buffer.getvalue())
+                self._loop_frames = len(frames)
+            except Exception:
+                # A monitor must never be able to fail the render it watches.
+                # The still above already shipped; the consumer falls back.
+                self._loop_frames = 0
         with open(self.history_path, "a") as handle:
             handle.write(
                 json.dumps(
@@ -376,6 +424,10 @@ class LivePreviewMonitor:
             "stage_forwards": self.stage_forwards,
             "sigma": self.sigma,
             "preview": self._last_preview.name if self._last_preview else None,
+            # The animated companion, named only once it exists. A consumer that
+            # does not know the key keeps using `preview` and sees a still.
+            "preview_loop": LOOP_FILENAME if self._loop_frames else None,
+            "preview_loop_frames": self._loop_frames or None,
             "preview_path": str(self._last_preview) if self._last_preview else None,
             "preview_latest_path": str(self.latest_path) if self._last_preview else None,
             "abort_sentinel": str(self.abort_path),
