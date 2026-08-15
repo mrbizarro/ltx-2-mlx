@@ -648,8 +648,14 @@ class TI2VidTwoStagesPipeline(BasePipeline):
         teacache_thresh: float | None = None,
         prompt_relay=None,
         live_preview=None,
+        loose_reference: bool = False,
     ) -> str:
         """Generate two-stage video+audio and save to file.
+
+        ``loose_reference`` — "Inspire": the reference image guides subject
+        and style while the composition re-imagines itself (skips the
+        masked-sample anchor re-pin). Forwarded only when True so the parent
+        Euler pipeline, which has no use for it, never sees the key.
 
         ``stage1_steps`` defaults to ``None`` so subclasses can apply
         their own default (Euler: 30, HQ res_2s: 15) without being
@@ -687,6 +693,8 @@ class TI2VidTwoStagesPipeline(BasePipeline):
             gen_kwargs["prompt_relay"] = prompt_relay
         if stage1_sigmas is not None:
             gen_kwargs["stage1_sigmas"] = stage1_sigmas
+        if loose_reference:
+            gen_kwargs["loose_reference"] = True
         if stage2_sigmas is not None:
             gen_kwargs["stage2_sigmas"] = stage2_sigmas
         if schedule_preset is not None:

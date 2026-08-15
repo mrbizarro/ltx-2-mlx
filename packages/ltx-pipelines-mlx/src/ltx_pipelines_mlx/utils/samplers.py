@@ -145,8 +145,16 @@ def denoise_loop(
     show_progress: bool = True,
     diffusion_step=None,
     preview=None,
+    repin_masked_sample: bool = True,
 ) -> DenoiseOutput:
     """Run the Euler denoising loop for joint audio+video.
+
+    ``repin_masked_sample`` — the +ltx25.4 anchor fix: re-composite the
+    conditioned tokens into the SAMPLE after the ancestral step. Defaults to
+    True (the fixed behavior every lane ships with). Passing False restores
+    the pre-fix drift ON PURPOSE — the "Inspire" mode: the reference guides
+    subject and style while the composition is re-imagined. Euler lanes are
+    unaffected either way (velocity is zero at a pinned token).
 
     Args:
         model: X0Model wrapping the LTXModel.
@@ -280,10 +288,10 @@ def denoise_loop(
         # Guarded by the uniform-mask flags, so t2v (mask all ones) is
         # untouched and byte-identical, as is every Euler lane — keyframe/flf2v
         # included, which pins eta to 0 deliberately and never reaches here.
-        if not video_uniform:
+        if repin_masked_sample and not video_uniform:
             video_x = apply_denoise_mask(
                 video_x, video_state.clean_latent, video_state.denoise_mask)
-        if not audio_uniform:
+        if repin_masked_sample and not audio_uniform:
             audio_x = apply_denoise_mask(
                 audio_x, audio_state.clean_latent, audio_state.denoise_mask)
 
@@ -384,8 +392,18 @@ def res2s_denoise_loop(
     tap: callable | None = None,
     teacache=None,
     preview=None,
+    repin_masked_sample: bool = False,
 ) -> DenoiseOutput:
     """Run the res_2s second-order denoising loop for joint audio+video.
+
+    ``repin_masked_sample`` — when True, the conditioned (masked) tokens are
+    re-composited into the SAMPLE after each SDE update, not only into the x0
+    estimate: this loop injects fresh noise at both substep and step level,
+    unmasked, so an i2v anchor is attenuated and buried exactly like the
+    euler-ancestral case fixed in +ltx25.4 — the delivered frame 0 matches
+    while the clip composes without the image. Defaults to False so every
+    existing caller (2.3's HQ lane included) stays byte-identical; the HQ
+    pipeline resolves it per model generation.
 
     Ported from ltx-pipelines res2s_audio_video_denoising_loop. Uses a
     second-order exponential integrator with SDE noise injection at both
@@ -678,6 +696,17 @@ def res2s_denoise_loop(
         x_mid_v = _sde_step(x_anchor_v, x_mid_v, sigma, sub_sigma, sub_noise_v).astype(mx.float32)
         x_mid_a = _sde_step(x_anchor_a, x_mid_a, sigma, sub_sigma, sub_noise_a).astype(mx.float32)
 
+        # RE-PIN THE SAMPLE at the substep (see the docstring): the SDE update
+        # above re-noised the conditioned tokens; stage 2's forward must see
+        # the anchor, not its noise-buried remains.
+        if repin_masked_sample:
+            if not video_uniform:
+                x_mid_v = apply_denoise_mask(
+                    x_mid_v, video_state.clean_latent, video_state.denoise_mask)
+            if not audio_uniform:
+                x_mid_a = apply_denoise_mask(
+                    x_mid_a, audio_state.clean_latent, audio_state.denoise_mask)
+
         # Bong iteration: refine anchor for stability at small step sizes
         if bongmath and h < 0.5 and sigma > 0.03:
             for _ in range(bongmath_max_iter):
@@ -708,6 +737,15 @@ def res2s_denoise_loop(
         step_noise_a = _channelwise_normalize(mx.random.normal(audio_x.shape).astype(mx.float32))
         video_x = _sde_step(x_anchor_v, x_next_v, sigma, sigma_next, step_noise_v).astype(mx.float32)
         audio_x = _sde_step(x_anchor_a, x_next_a, sigma, sigma_next, step_noise_a).astype(mx.float32)
+
+        # RE-PIN THE SAMPLE at the step level, same reasoning as the substep.
+        if repin_masked_sample:
+            if not video_uniform:
+                video_x = apply_denoise_mask(
+                    video_x, video_state.clean_latent, video_state.denoise_mask)
+            if not audio_uniform:
+                audio_x = apply_denoise_mask(
+                    audio_x, audio_state.clean_latent, audio_state.denoise_mask)
 
         mx.async_eval(video_x, audio_x)
 

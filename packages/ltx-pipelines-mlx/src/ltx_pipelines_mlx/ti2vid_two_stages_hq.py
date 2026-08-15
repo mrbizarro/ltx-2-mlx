@@ -217,6 +217,7 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
         teacache_thresh: float | None = None,
         tap: callable | None = None,
         live_preview=None,
+        loose_reference: bool = False,
     ) -> tuple[mx.array, mx.array]:
         """Generate video using HQ two-stage pipeline with res_2s sampler.
 
@@ -224,6 +225,14 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
         for Stage 1 instead of Euler. ``enable_teacache`` / ``teacache_thresh``
         / ``tap`` are forwarded to ``res2s_denoise_loop`` exactly as in the
         Euler path.
+
+        ``loose_reference`` (2.5 only) — "Inspire": keep the conditioning
+        image as subject/style guidance but let the composition re-imagine
+        itself, i.e. deliberately skip the masked-sample re-pin that anchors
+        i2v. False (the default) resolves per generation: on >= 2.5 the
+        sample is re-pinned each res_2s update so i2v actually animates the
+        supplied image (the +ltx25.4 fix, extended to this loop); 2.3 keeps
+        its historical bytes untouched.
         """
         # --- Text encoding (Prompt Relay: encode the combined prompt) ---
         encode_prompt, relay_token_ranges = self._prompt_relay_setup(prompt, prompt_relay)
@@ -344,6 +353,13 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
             teacache_controller = _build_hq_teacache_controller(stage1_steps, teacache_thresh)
             teacache_controller.reset()
         self._pre_denoise_flush(video_state, audio_state)
+        # Masked-sample re-pin, resolved per generation like the stage-2
+        # schedule and modality scale: 2.5 anchors i2v for real (the
+        # +ltx25.4 class, closed on this loop too), 2.3 keeps its
+        # historical bytes. ``loose_reference`` (Inspire) turns it off on
+        # purpose — the accidental behavior the owner graded as a feature,
+        # now an explicit choice instead of a defect.
+        _repin = (model_version_of(self.dit) >= (2, 5)) and not loose_reference
         output_1 = res2s_denoise_loop(
             model=x0_model,
             video_state=video_state,
@@ -357,6 +373,7 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
             teacache=teacache_controller,
             tap=tap,
             preview=live_preview,
+            repin_masked_sample=_repin,
         )
         if self.low_memory:
             aggressive_cleanup()
@@ -455,6 +472,11 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
             # this refine pass is the Euler one the 2.5 templates replace.
             diffusion_step=resolve_diffusion_step(self.dit),
             preview=live_preview,
+            # Inspire carries through the refine pass too — re-pinning the
+            # reference here would anchor stage 2 to a composition stage 1
+            # deliberately departed from. The default (True) is +ltx25.4's
+            # shipped behavior, unchanged for anchored renders.
+            repin_masked_sample=not loose_reference,
         )
         if self.low_memory:
             aggressive_cleanup()

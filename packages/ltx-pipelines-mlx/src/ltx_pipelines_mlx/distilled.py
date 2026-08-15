@@ -129,6 +129,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         stage1_sigmas=None,
         stage2_sigmas=None,
         schedule_preset: str | None = None,
+        loose_reference: bool = False,
         image: str | None = None,
         images=None,
         prompt_relay=None,
@@ -155,6 +156,11 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             schedule_preset: Named schedule for this lane —  ``"default"``,
                 ``"fast"`` or ``"vendor"`` on LTX-2.5. See
                 :func:`~ltx_pipelines_mlx.scheduler.resolve_distilled_schedule`.
+            loose_reference: "Inspire" — keep the reference image as
+                subject/style guidance but skip the masked-sample re-pin, so
+                the composition re-imagines itself instead of animating the
+                image. Default False = anchored i2v (the +ltx25.4 fix). Only
+                meaningful with a conditioning image; inert on t2v.
             image: Optional reference image for I2V conditioning.
             **_unused_kwargs: Accepted (and ignored) for signature compatibility
                 with :meth:`TI2VidTwoStagesPipeline.generate_two_stage`. CFG / STG /
@@ -294,6 +300,8 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             # LTX-2.5 samples stage 1 ancestrally; 2.3 gets None -> plain Euler.
             diffusion_step=resolve_diffusion_step(self.dit),
             preview=live_preview,
+            # Inspire: deliberately skip the anchor re-pin (see the docstring).
+            repin_masked_sample=not loose_reference,
         )
         if self.low_memory:
             aggressive_cleanup()
@@ -385,6 +393,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             video_cross_attention_mask=relay_mask(F, H_full, W_full, video_state_2.latent.shape[1]),
             diffusion_step=resolve_diffusion_step(self.dit),
             preview=live_preview,
+            repin_masked_sample=not loose_reference,
         )
         if self.low_memory:
             aggressive_cleanup()
