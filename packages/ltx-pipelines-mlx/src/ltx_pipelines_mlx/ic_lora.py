@@ -152,6 +152,15 @@ class ICLoraPipeline(BasePipeline):
         self.distilled_lora_path = distilled_lora
         self.distilled_lora_strength = distilled_lora_strength
 
+    def _checkpoint_version(self) -> tuple[int, ...]:
+        """The loaded checkpoint's generation, (2, 3) when unknown."""
+        try:
+            from ltx_pipelines_mlx.utils.sampler_choice import model_version_of
+            v = model_version_of(self.dit)
+            return tuple(v) if v else (2, 3)
+        except Exception:                                      # noqa: BLE001
+            return (2, 3)
+
     def load(self) -> None:
         """Load generation components: DiT, VAE encoder, upsampler.
 
@@ -409,8 +418,17 @@ class ICLoraPipeline(BasePipeline):
         single_stage: bool = False,
         upsample_only: bool = False,
         refine_steps: int | None = None,
+        source_video: str | None = None,
     ) -> tuple[mx.array, mx.array]:
         """Generate video with IC-LoRA reference conditioning.
+
+        ``source_video`` (Phosphene, Upscale ×2): skip Stage 1 entirely. The
+        clip is VAE-encoded at the half-res canvas, latent-upsampled ×2 with
+        the pack's spatial upscaler, and the control-aware refine (``refine_steps``
+        of the distilled tail, default 3) runs with the IC-LoRA and the clip
+        re-appended as reference at full res. Identity and motion come from the
+        clip's own latent instead of being re-generated from noise; the adapter
+        only invents the fine detail. Two-stage layout (dims snap to 64).
 
         Args:
             prompt: Text prompt.
@@ -484,6 +502,13 @@ class ICLoraPipeline(BasePipeline):
         # be multiples of 64); single-stage generates directly at full target res
         # (Comfy Union Control topology, multiples of 32). Snap up front and report
         # if the requested dims changed; downstream derivations stay consistent.
+        source_mode = bool(source_video)
+        if source_mode:
+            single_stage = False
+            skip_stage_2 = False
+            upsample_only = False
+            if not refine_steps:
+                refine_steps = 3
         height, width = snap_output_dimensions(height, width, two_stage=not single_stage)
         if single_stage:
             gen_h, gen_w = height, width
@@ -540,30 +565,60 @@ class ICLoraPipeline(BasePipeline):
 
         # Denoise stage 1. Dev and distilled share the fixed 8-step DISTILLED_SIGMAS
         # (the Comfy IC-LoRA workflows use these exact ManualSigmas for stage 1).
-        sigmas_1 = thin_sigmas(DISTILLED_SIGMAS, stage1_steps, name="stage 1")
+        # LTX-2.5 checkpoints carry their own tables (vendor stage 1, the
+        # 3-step stage 2); the 2.3 constants below are wrong for them. Keyed
+        # off the loaded checkpoint, so 2.3 renders are byte-identical.
+        _mv = self._checkpoint_version()
+        if _mv >= (2, 5):
+            from ltx_pipelines_mlx.scheduler import resolve_distilled_schedule
+            sigmas_1, _sigmas_2_25 = resolve_distilled_schedule(
+                _mv, stage1_steps=stage1_steps, stage2_steps=stage2_steps)
+        else:
+            sigmas_1 = thin_sigmas(DISTILLED_SIGMAS, stage1_steps, name="stage 1")
         x0_model = X0Model(self.dit)
 
-        self._pre_denoise_flush(video_state, audio_state)
-        output_1 = denoise_loop(
-            model=x0_model,
-            video_state=video_state,
-            audio_state=audio_state,
-            video_text_embeds=video_embeds,
-            audio_text_embeds=audio_embeds,
-            sigmas=sigmas_1,
-        )
-        if self.low_memory:
-            aggressive_cleanup()
+        if source_mode:
+            # Stage 1 replaced by the clip itself: its frames at the half-res
+            # canvas, VAE-encoded into the same model-space latent Stage 1
+            # would have produced. The VAE wants 1+8k frames; the caller's
+            # num_frames already is (the reference loader rounds the same way).
+            k = max(1, (num_frames - 1) // 8)
+            src_frames = load_video_frames_normalized(str(source_video), gen_h, gen_w, 1 + k * 8)
+            src_frames = (src_frames * 2.0 - 1.0).astype(mx.bfloat16)
+            video_half = self.vae_encoder.encode(src_frames)
+            mx.eval(video_half)
+            if video_half.shape[2] != F:
+                raise ValueError(
+                    f"source clip encodes to {video_half.shape[2]} latent frames, "
+                    f"target needs {F} — pass num_frames = 1 + 8k with k*8+1 <= clip frames")
+            # No generated audio to refine: the audio lane starts from noise and
+            # its output is discarded by the caller (the source soundtrack is
+            # muxed back in). It only has to be shaped like a Stage 1 result.
+            audio_latent_1 = audio_state.latent
+            logger.info("Upscale from source: Stage 1 skipped, %s latent from %s", tuple(video_half.shape), source_video)
+        else:
+            self._pre_denoise_flush(video_state, audio_state)
+            output_1 = denoise_loop(
+                model=x0_model,
+                video_state=video_state,
+                audio_state=audio_state,
+                video_text_embeds=video_embeds,
+                audio_text_embeds=audio_embeds,
+                sigmas=sigmas_1,
+            )
+            if self.low_memory:
+                aggressive_cleanup()
 
-        # Extract only generation tokens (exclude appended reference tokens)
-        gen_tokens = output_1.video_latent[:, : F * H_half * W_half, :]
-        video_half = self.video_patchifier.unpatchify(gen_tokens, (F, H_half, W_half))
+            # Extract only generation tokens (exclude appended reference tokens)
+            gen_tokens = output_1.video_latent[:, : F * H_half * W_half, :]
+            video_half = self.video_patchifier.unpatchify(gen_tokens, (F, H_half, W_half))
+            audio_latent_1 = output_1.audio_latent
 
-        # single_stage: full-res one-pass output (Union Control topology).
-        # skip_stage_2: half-res preview. Either way, return after Stage 1.
-        if single_stage or skip_stage_2:
-            audio_latent = self.audio_patchifier.unpatchify(output_1.audio_latent)
-            return video_half, audio_latent
+            # single_stage: full-res one-pass output (Union Control topology).
+            # skip_stage_2: half-res preview. Either way, return after Stage 1.
+            if single_stage or skip_stage_2:
+                audio_latent = self.audio_patchifier.unpatchify(output_1.audio_latent)
+                return video_half, audio_latent
 
         # --- Stage 2: Upscale + refine (no IC-LoRA, clean distilled model) ---
         # Upscale with denormalize/renormalize wrapping (matching reference).
@@ -587,9 +642,9 @@ class ICLoraPipeline(BasePipeline):
         # (below) that keeps the IC-LoRA fused and re-applies the control at full
         # res — cleaning upsampler artifacts without the adherence drift of the
         # legacy two-stage Stage 2.
-        control_aware_refine = upsample_only and bool(refine_steps)
+        control_aware_refine = (upsample_only or source_mode) and bool(refine_steps)
         if upsample_only and not control_aware_refine:
-            audio_latent = self.audio_patchifier.unpatchify(output_1.audio_latent)
+            audio_latent = self.audio_patchifier.unpatchify(audio_latent_1)
             if self.low_memory:
                 self.image_conditioner.free()
                 self.upsampler = None
@@ -667,7 +722,8 @@ class ICLoraPipeline(BasePipeline):
             n = max(1, min(int(refine_steps), len(DISTILLED_SIGMAS) - 1))
             sigmas_2 = DISTILLED_SIGMAS[len(DISTILLED_SIGMAS) - 1 - n :]
         else:
-            sigmas_2 = thin_sigmas(STAGE_2_SIGMAS, stage2_steps, name="stage 2")
+            sigmas_2 = (_sigmas_2_25 if _mv >= (2, 5)
+                        else thin_sigmas(STAGE_2_SIGMAS, stage2_steps, name="stage 2"))
         start_sigma = sigmas_2[0]
 
         video_positions_2 = compute_video_positions(F, H_full, W_full, frame_rate=frame_rate)
@@ -690,7 +746,7 @@ class ICLoraPipeline(BasePipeline):
         )
 
         # Audio refined in stage 2
-        audio_tokens_1 = output_1.audio_latent
+        audio_tokens_1 = audio_latent_1
         audio_state_2 = create_noised_state(
             base_shape=audio_tokens_1.shape,
             conditionings=[],
@@ -743,6 +799,7 @@ class ICLoraPipeline(BasePipeline):
         single_stage: bool = False,
         upsample_only: bool = False,
         refine_steps: int | None = None,
+        source_video: str | None = None,
     ) -> str:
         """Generate IC-LoRA conditioned video+audio and save to file.
 
@@ -783,6 +840,7 @@ class ICLoraPipeline(BasePipeline):
             single_stage=single_stage,
             upsample_only=upsample_only,
             refine_steps=refine_steps,
+            source_video=source_video,
         )
 
         # Free generation components to make room for decoders
