@@ -232,10 +232,42 @@ def test_distilled_retake_runs_positive_only_on_plain_euler(monkeypatch):
     assert vm[1].min().item() == 1.0 and vm[0].max().item() == 0.0 and vm[2].max().item() == 0.0
 
 
-def test_extend_refuses_the_distilled_mode():
+def test_distilled_extend_appends_on_plain_euler(monkeypatch):
     pipe = _stub_retake()
-    with pytest.raises(NotImplementedError):
-        pipe.extend("p", mx.zeros((1, 128, 2, 2, 2)), mx.zeros((1, 8, 8, 16)), 1, frame_rate=24.0)
+    calls = {}
+
+    def no_negative(*a, **k):
+        raise AssertionError("distilled extend must not encode a negative prompt or load the dev model")
+
+    pipe._encode_text_with_negative = no_negative
+    pipe._load_dev_transformer = no_negative
+    pipe._encode_positive_prompt = lambda prompt: (mx.zeros((1, 4, 8)), mx.zeros((1, 4, 8)))
+
+    def fake_loop(**kw):
+        calls.update(kw)
+        return DenoiseOutput(video_latent=kw["video_state"].latent, audio_latent=kw["audio_state"].latent)
+
+    def refuse_guided(**kw):
+        raise AssertionError("guided loop on the distilled lane")
+
+    monkeypatch.setattr(retake_mod, "denoise_loop", fake_loop)
+    monkeypatch.setattr(retake_mod, "guided_denoise_loop", refuse_guided)
+    F, H, W = 3, 2, 2
+    v, _a = pipe.extend(
+        "p",
+        mx.zeros((1, 128, F, H, W)),
+        mx.zeros((1, 8, 13, 16)),
+        2,
+        height=H * 32,
+        width=W * 32,
+        num_frames=17,
+        frame_rate=24.0,
+        num_steps=8,
+    )
+    assert v.shape == (1, 128, F + 2, H, W)
+    assert calls["sigmas"][0] == 1.0 and calls["sigmas"][-1] == 0.0
+    vm = calls["video_state"].denoise_mask.reshape(F + 2, H * W)
+    assert vm[:F].max().item() == 0.0 and vm[F:].min().item() == 1.0  # source kept, new frames generated
 
 
 def test_constructor_default_keeps_the_dev_lane():

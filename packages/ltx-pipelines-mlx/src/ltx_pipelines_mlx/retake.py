@@ -80,9 +80,8 @@ class RetakePipeline(BasePipeline):
             negative prompt — upstream ``RetakePipeline``'s default mode
             (``distilled=True``: ``DISTILLED_SIGMAS`` + ``SimpleDenoiser``,
             deterministic Euler; ported from dgrauet/ltx-2-mlx#204). Runs on the
-            base pack alone, so a Mac without the dev weights can retake.
-            Default False keeps the dev path. :meth:`extend` has no distilled
-            mode and raises.
+            base pack alone, so a Mac without the dev weights can retake or
+            extend. Default False keeps the dev path.
     """
 
     def __init__(
@@ -499,13 +498,21 @@ class RetakePipeline(BasePipeline):
             Tuple of (extended_video_latent, extended_audio_latent).
         """
         if self.distilled:
-            raise NotImplementedError(
-                "extend has no distilled mode; build RetakePipeline without distilled=True."
-            )
-        video_embeds, audio_embeds, neg_video_embeds, neg_audio_embeds = self._encode_text_with_negative(prompt)
+            # Same masked-token construction as the dev path below — only the
+            # model, the prompt encoding and the schedule differ (the
+            # distilled transformer on its own table, positive prompt only).
+            # Upstream's later `extend --distilled` (#209) continues in
+            # 25-frame-carry windows instead; this is the retake-shaped form,
+            # whose cost follows the whole clip like the dev path's does.
+            video_embeds, audio_embeds = self._encode_positive_prompt(prompt)
+            neg_video_embeds = neg_audio_embeds = None
+            if self.dit is None:
+                self.dit = self._load_distilled_transformer()
+        else:
+            video_embeds, audio_embeds, neg_video_embeds, neg_audio_embeds = self._encode_text_with_negative(prompt)
 
-        if self.dit is None:
-            self.dit = self._load_dev_transformer()
+            if self.dit is None:
+                self.dit = self._load_dev_transformer()
         assert self.dit is not None
 
         B = source_video_latent.shape[0]
@@ -589,6 +596,14 @@ class RetakePipeline(BasePipeline):
             positions=audio_positions,
         )
         audio_state = noise_latent_state(audio_state, sigma=1.0, seed=seed + 1)
+
+        if self.distilled:
+            output = self._distilled_denoise(video_state, audio_state, video_embeds, audio_embeds, num_steps)
+            if self.low_memory:
+                aggressive_cleanup()
+            video_latent = self.video_patchifier.unpatchify(output.video_latent, (F_total, H, W))
+            audio_latent = self.audio_patchifier.unpatchify(output.audio_latent)
+            return video_latent, audio_latent
 
         num_tokens = F_total * H * W
         sigmas = ltx2_schedule(num_steps, num_tokens=num_tokens)
