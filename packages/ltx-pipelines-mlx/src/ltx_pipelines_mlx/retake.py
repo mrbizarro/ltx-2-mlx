@@ -91,8 +91,14 @@ class RetakePipeline(BasePipeline):
         low_memory: bool = True,
         dev_transformer: str = "transformer-dev.safetensors",
         distilled: bool = False,
+        low_ram_streaming: bool = False,
     ):
-        super().__init__(model_dir, gemma_model_id=gemma_model_id, low_memory=low_memory)
+        # low_ram_streaming: the distilled lane opens Retake/Extend to the
+        # small Macs block streaming exists for, so the flag must reach
+        # BasePipeline (it was silently dropped by callers that filter kwargs).
+        super().__init__(
+            model_dir, gemma_model_id=gemma_model_id, low_memory=low_memory, low_ram_streaming=low_ram_streaming
+        )
         self._dev_transformer = dev_transformer
         self.distilled = bool(distilled)
 

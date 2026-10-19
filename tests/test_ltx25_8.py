@@ -273,3 +273,10 @@ def test_distilled_extend_appends_on_plain_euler(monkeypatch):
 def test_constructor_default_keeps_the_dev_lane():
     sig = inspect.signature(RetakePipeline.__init__)
     assert sig.parameters["distilled"].default is False
+
+
+def test_retake_pipeline_takes_low_ram_streaming():
+    sig = inspect.signature(RetakePipeline.__init__)
+    assert sig.parameters["low_ram_streaming"].default is False
+    src = inspect.getsource(RetakePipeline.__init__)
+    assert "low_ram_streaming=low_ram_streaming" in src
