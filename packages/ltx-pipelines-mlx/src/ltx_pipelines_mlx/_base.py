@@ -491,6 +491,41 @@ class BasePipeline:
 
         return video_embeds, audio_embeds
 
+    def _checkpoint_generation(self) -> tuple[int, ...]:
+        """This pipeline's checkpoint generation, e.g. ``(2, 5, 0)``.
+
+        Read off the loaded DiT when there is one (every wrapper is walked by
+        ``model_version_of``), else from the pack's own config files, so it
+        answers before ``load()`` too. ``(2, 3)`` when nothing says otherwise —
+        the oldest behaviour, never an accidental opt-in to a newer one.
+        """
+        try:
+            from ltx_pipelines_mlx.utils.sampler_choice import model_version_of
+
+            version = model_version_of(self.dit) if self.dit is not None else ()
+            if version:
+                return tuple(version)
+        except Exception:  # a version probe must never break a render
+            pass
+        try:
+            from ltx_core_mlx.model.transformer.model import LTXModelConfig
+
+            return tuple(LTXModelConfig.from_checkpoint_dir(self.model_dir).model_version)
+        except Exception:
+            return (2, 3)
+
+    def _default_image_crf(self) -> int:
+        """CRF for conditioning images that did not set their own.
+
+        Upstream ``ImageConditioner.resolve_crf``: 18 from LTX-2.4 on, 33
+        before (``media_io.image_crf_for_version``; ``LTX_IMAGE_CRF`` forces
+        a value for A/B). Not cached: the env override is read per call and
+        the probe is a dict lookup on a loaded model.
+        """
+        from ltx_pipelines_mlx.utils.media_io import image_crf_for_version
+
+        return image_crf_for_version(self._checkpoint_generation())
+
     def _encode_text(self, prompt: str) -> tuple[mx.array, mx.array]:
         """Encode prompt to (video, audio) embeddings via the PromptEncoder block.
 

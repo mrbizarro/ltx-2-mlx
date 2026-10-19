@@ -40,6 +40,7 @@ def _encode_keyframe(
     image: Image.Image | str,
     height: int,
     width: int,
+    crf: int | None = None,
 ) -> mx.array:
     """Encode a keyframe image at a specific resolution.
 
@@ -52,7 +53,10 @@ def _encode_keyframe(
     Returns:
         Patchified keyframe tokens (1, H*W, 128).
     """
-    img_tensor = prepare_image_for_encoding(image, height, width)
+    if crf is None:
+        img_tensor = prepare_image_for_encoding(image, height, width)
+    else:
+        img_tensor = prepare_image_for_encoding(image, height, width, crf=crf)
     # (1, 3, H, W) -> (1, 3, 1, H, W) for single-frame video encoding
     latent = vae_encoder.encode(img_tensor[:, :, None, :, :])
     mx.eval(latent)  # Force evaluation to avoid graph buildup
@@ -170,8 +174,9 @@ class KeyframeInterpolationPipeline(TI2VidTwoStagesPipeline):
         _materialize = getattr(mx, "eval")  # noqa: B009
 
         def _encode_all_keyframes(encoder) -> tuple[list, list]:
-            half = [_encode_keyframe(encoder, img, enc_h_half, enc_w_half) for img in keyframe_images]
-            full = [_encode_keyframe(encoder, img, up_h, up_w) for img in keyframe_images]
+            kf_crf = self._default_image_crf()
+            half = [_encode_keyframe(encoder, img, enc_h_half, enc_w_half, crf=kf_crf) for img in keyframe_images]
+            full = [_encode_keyframe(encoder, img, up_h, up_w, crf=kf_crf) for img in keyframe_images]
             _materialize(*(half + full))  # materialize before encoder is freed
             return half, full
 

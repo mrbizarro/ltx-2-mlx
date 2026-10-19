@@ -45,8 +45,8 @@ from ltx_core_mlx.utils.image import load_video_frames
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
 from ltx_pipelines_mlx._base import BasePipeline
-from ltx_pipelines_mlx.scheduler import ltx2_schedule
-from ltx_pipelines_mlx.utils.samplers import guided_denoise_loop
+from ltx_pipelines_mlx.scheduler import ltx2_schedule, resolve_distilled_schedule, thin_sigmas
+from ltx_pipelines_mlx.utils.samplers import denoise_loop, guided_denoise_loop
 
 # Reference defaults (LTX_2_3_PARAMS)
 DEFAULT_CFG_SCALE = 3.0
@@ -74,6 +74,15 @@ class RetakePipeline(BasePipeline):
         gemma_model_id: Gemma model for text encoding.
         low_memory: Aggressive memory management.
         dev_transformer: Dev transformer filename.
+        distilled: Retake on the DISTILLED transformer (``transformer.safetensors``
+            or ``transformer-distilled*.safetensors``) with the checkpoint's own
+            fixed distilled table, one forward per step, no CFG / STG and no
+            negative prompt — upstream ``RetakePipeline``'s default mode
+            (``distilled=True``: ``DISTILLED_SIGMAS`` + ``SimpleDenoiser``,
+            deterministic Euler; ported from dgrauet/ltx-2-mlx#204). Runs on the
+            base pack alone, so a Mac without the dev weights can retake.
+            Default False keeps the dev path. :meth:`extend` has no distilled
+            mode and raises.
     """
 
     def __init__(
@@ -82,9 +91,11 @@ class RetakePipeline(BasePipeline):
         gemma_model_id: str = "mlx-community/gemma-3-12b-it-4bit",
         low_memory: bool = True,
         dev_transformer: str = "transformer-dev.safetensors",
+        distilled: bool = False,
     ):
         super().__init__(model_dir, gemma_model_id=gemma_model_id, low_memory=low_memory)
         self._dev_transformer = dev_transformer
+        self.distilled = bool(distilled)
 
     def _encode_source_video(
         self,
@@ -279,12 +290,19 @@ class RetakePipeline(BasePipeline):
         Returns:
             Tuple of (video_latent, audio_latent).
         """
-        # --- Text encoding (positive + negative for CFG) ---
-        video_embeds, audio_embeds, neg_video_embeds, neg_audio_embeds = self._encode_text_with_negative(prompt)
+        if self.distilled:
+            # --- Text encoding (positive only — no CFG on the distilled lane) ---
+            video_embeds, audio_embeds = self._encode_positive_prompt(prompt)
+            neg_video_embeds = neg_audio_embeds = None
+            if self.dit is None:
+                self.dit = self._load_distilled_transformer()
+        else:
+            # --- Text encoding (positive + negative for CFG) ---
+            video_embeds, audio_embeds, neg_video_embeds, neg_audio_embeds = self._encode_text_with_negative(prompt)
 
-        # --- Load dev transformer ---
-        if self.dit is None:
-            self.dit = self._load_dev_transformer()
+            # --- Load dev transformer ---
+            if self.dit is None:
+                self.dit = self._load_dev_transformer()
         assert self.dit is not None
 
         F, H, W = compute_video_latent_shape(num_frames, height, width)
@@ -333,6 +351,14 @@ class RetakePipeline(BasePipeline):
         )
         audio_state = noise_latent_state(audio_state, sigma=1.0, seed=seed + 1)
 
+        if self.distilled:
+            output = self._distilled_denoise(video_state, audio_state, video_embeds, audio_embeds, num_steps)
+            if self.low_memory:
+                aggressive_cleanup()
+            video_latent = self.video_patchifier.unpatchify(output.video_latent, (F, H, W))
+            audio_latent = self.audio_patchifier.unpatchify(output.audio_latent)
+            return video_latent, audio_latent
+
         # --- Guided denoising ---
         num_tokens = F * H * W
         sigmas = ltx2_schedule(num_steps, num_tokens=num_tokens)
@@ -376,6 +402,61 @@ class RetakePipeline(BasePipeline):
 
         return video_latent, audio_latent
 
+    def _encode_positive_prompt(self, prompt: str) -> tuple[mx.array, mx.array]:
+        """Load the text encoder, encode the prompt alone, materialize, free it.
+
+        The positive half of :meth:`_encode_text_with_negative`, for the
+        distilled mode (upstream encodes ``[prompt]`` only when distilled).
+        """
+        _materialize = getattr(mx, "eval")  # noqa: B009 -- security hook flags mx.eval pattern
+        self._load_text_encoder()
+        video_embeds, audio_embeds = self._encode_text(prompt)
+        _materialize(video_embeds, audio_embeds)
+        self.text_encoder = None
+        self.feature_extractor = None
+        aggressive_cleanup()
+        return video_embeds, audio_embeds
+
+    def _load_distilled_transformer(self):
+        """The distilled transformer, resolved as the distilled pipelines do."""
+        transformer_path = self.model_dir / "transformer.safetensors"
+        if not transformer_path.exists():
+            transformer_path = self._resolve_safetensors(self.model_dir, "transformer-distilled")
+        return self._load_transformer_with_optional_streaming(transformer_path)
+
+    def distilled_sigmas(self, num_steps: int | None) -> list[float]:
+        """The distilled retake schedule for this checkpoint.
+
+        The checkpoint's own stage-1 distilled table (2.5 and 2.3 differ),
+        thinned to ``num_steps`` when that is fewer than the table holds —
+        always keeping sigma 1.0 and the terminal 0.0. A larger count runs the
+        whole table rather than raising: the table is the ceiling, and the
+        panel's dev-lane default (8) must not become an error here.
+        """
+        table, _ = resolve_distilled_schedule(self._checkpoint_generation())
+        table = [float(x) for x in table]
+        if num_steps is None or int(num_steps) >= len(table) - 1:
+            return table
+        return thin_sigmas(table, max(1, int(num_steps)), name="retake")
+
+    def _distilled_denoise(self, video_state, audio_state, video_embeds, audio_embeds, num_steps):
+        """Distilled model: fixed distilled sigmas, one forward per step, deterministic Euler.
+
+        Upstream's distilled retake does NOT switch to the ancestral sampler on
+        LTX-2.5 checkpoints (dgrauet/ltx-2-mlx#204 says so explicitly), and
+        neither does this: preserved tokens stay pinned by construction.
+        """
+        sigmas = self.distilled_sigmas(num_steps)
+        self._pre_denoise_flush(video_state, audio_state)
+        return denoise_loop(
+            model=X0Model(self.dit),
+            video_state=video_state,
+            audio_state=audio_state,
+            video_text_embeds=video_embeds,
+            audio_text_embeds=audio_embeds,
+            sigmas=sigmas,
+        )
+
     def extend(
         self,
         prompt: str,
@@ -417,6 +498,10 @@ class RetakePipeline(BasePipeline):
         Returns:
             Tuple of (extended_video_latent, extended_audio_latent).
         """
+        if self.distilled:
+            raise NotImplementedError(
+                "extend has no distilled mode; build RetakePipeline without distilled=True."
+            )
         video_embeds, audio_embeds, neg_video_embeds, neg_audio_embeds = self._encode_text_with_negative(prompt)
 
         if self.dit is None:

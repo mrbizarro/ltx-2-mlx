@@ -43,6 +43,39 @@ from ltx_core_mlx.utils.ffmpeg import find_ffmpeg
 # PNG/JPEG textures during I2V conditioning.
 DEFAULT_IMAGE_CRF = 33
 
+# From LTX-2.4 on, Lightricks re-compresses conditioning images far more
+# lightly: upstream ``ltx_pipelines.utils.constants.LTX_2_4_IMAGE_CRF = 18``,
+# resolved per checkpoint by ``ImageConditioner.resolve_crf`` (and every
+# official ComfyUI 2.5 graph sets ``LTXVPreprocess`` to 18). 2.3 checkpoints
+# carry no model_version and keep 33.
+LTX_2_4_IMAGE_CRF = 18
+IMAGE_CRF_SINCE_VERSION = (2, 4)
+
+#: A/B and escape hatch: an integer here wins over the per-generation default
+#: for every image that did not set its own CRF. Never the default path.
+IMAGE_CRF_ENV_VAR = "LTX_IMAGE_CRF"
+
+
+def image_crf_for_version(version) -> int:
+    """The default conditioning-image CRF for a checkpoint generation.
+
+    ``version`` is the checkpoint's ``model_version`` tuple; ``()`` / ``None``
+    (unknown, or a 2.3 pack that declares none) selects the 2.3 value.
+    ``LTX_IMAGE_CRF`` overrides both when it parses as an integer >= 0.
+    """
+    import os
+
+    raw = (os.environ.get(IMAGE_CRF_ENV_VAR) or "").strip()
+    if raw:
+        try:
+            forced = int(raw)
+        except ValueError:
+            forced = -1
+        if forced >= 0:
+            return forced
+    v = tuple(version or ())
+    return LTX_2_4_IMAGE_CRF if v >= IMAGE_CRF_SINCE_VERSION else DEFAULT_IMAGE_CRF
+
 
 def to_vae_range(x: mx.array) -> mx.array:
     """Shift ``[0, 1]`` pixels to the VAE's expected ``[-1, 1]`` range."""

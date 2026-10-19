@@ -222,6 +222,7 @@ def combined_image_conditionings(
     spatial_dims: tuple[int, int, int],
     video_encoder,
     frame_rate: float,
+    default_crf: int | None = None,
 ):
     """Build a list of conditioning items from a list of input images.
 
@@ -239,6 +240,10 @@ def combined_image_conditionings(
         spatial_dims: ``(F, H, W)`` latent shape of the target video.
         video_encoder: VAE encoder instance (must expose ``encode``).
         frame_rate: Frame rate for keyframe positions.
+        default_crf: CRF for every image that left its own unset (``None``) —
+            the pipeline passes its checkpoint's value
+            (:meth:`BasePipeline._default_image_crf`). ``None`` here keeps the
+            2.3 value, 33.
 
     Returns:
         List of conditioning items ready to feed into
@@ -250,10 +255,13 @@ def combined_image_conditionings(
 
     conditionings: list = []
     for img in images:
-        # Forward the per-image CRF (upstream-iso). Falls back to the
-        # upstream default (33) if the image item doesn't expose a CRF
-        # field — preserves I2V quality alignment with training.
-        img_crf = getattr(img, "crf", DEFAULT_IMAGE_CRF)
+        # Forward the per-image CRF (upstream-iso). An image that left it
+        # unset takes the checkpoint's generation default (upstream
+        # ``ImageConditioner.resolve_crf``: 18 from LTX-2.4 on, 33 before);
+        # an explicit CRF, including 0, always wins.
+        img_crf = getattr(img, "crf", None)
+        if img_crf is None:
+            img_crf = DEFAULT_IMAGE_CRF if default_crf is None else int(default_crf)
         img_tensor = load_image_and_preprocess(img.path, enc_h, enc_w, crf=img_crf)
         img_tensor = img_tensor[:, :, None, :, :]  # add F=1 dim
         ref_latent = video_encoder.encode(img_tensor)  # (1, 128, 1, H', W')

@@ -184,6 +184,7 @@ class TI2VidOneStagePipeline(TI2VidTwoStagesPipeline):
                 enc_w=enc_w,
                 spatial_dims=(F, H, W),
                 video_encoder=self.vae_encoder,
+                default_crf=self._default_image_crf(),
                 frame_rate=frame_rate,
             )
 

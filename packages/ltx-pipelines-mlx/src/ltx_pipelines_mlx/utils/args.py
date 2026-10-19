@@ -40,14 +40,17 @@ class ImageConditioningInput(NamedTuple):
             (``VideoConditionByKeyframeIndex``).
         strength: Conditioning strength in ``[0, 1]``. ``1.0`` = fully
             preserved.
-        crf: Optional H.264 CRF for input degradation (default 33).
-            Currently accepted for API parity but not applied.
+        crf: Optional H.264 CRF for input degradation. ``None`` (default)
+            resolves from the checkpoint like upstream ``resolve_crf``:
+            33 before LTX-2.4, 18 from 2.4 on (see
+            :func:`~ltx_pipelines_mlx.utils.media_io.image_crf_for_version`).
+            An explicit value, including 0, always wins.
     """
 
     path: str
     frame_idx: int
     strength: float
-    crf: int = DEFAULT_IMAGE_CRF
+    crf: int | None = None
 
 
 class ImageAction(argparse.Action):
@@ -80,12 +83,12 @@ class ImageAction(argparse.Action):
 
         path = values[0]
         if len(values) == 1:
-            frame_idx, strength, crf = 0, 1.0, DEFAULT_IMAGE_CRF
+            frame_idx, strength, crf = 0, 1.0, None
         else:
             try:
                 frame_idx = int(values[1])
                 strength = float(values[2])
-                crf = int(values[3]) if len(values) == 4 else DEFAULT_IMAGE_CRF
+                crf = int(values[3]) if len(values) == 4 else None
             except (ValueError, TypeError) as e:
                 parser.error(f"{option_string}: could not parse FRAME_IDX/STRENGTH/CRF from {values[1:]}: {e}")
 

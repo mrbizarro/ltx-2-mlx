@@ -376,6 +376,7 @@ class ICLoraPipeline(BasePipeline):
                     enc_w=width,
                     spatial_dims=(F_lat, H_lat, W_lat),
                     video_encoder=video_encoder,
+                    default_crf=self._default_image_crf(),
                     frame_rate=frame_rate,
                 )
             )
@@ -678,6 +679,7 @@ class ICLoraPipeline(BasePipeline):
                     enc_w=enc_w_full,
                     spatial_dims=(F_full, H_full_lat, W_full_lat),
                     video_encoder=self.vae_encoder,
+                    default_crf=self._default_image_crf(),
                     frame_rate=frame_rate,
                 )
             )
@@ -712,6 +714,13 @@ class ICLoraPipeline(BasePipeline):
         # present to consume the re-appended reference tokens.
         if not self.dev_mode and not control_aware_refine:
             self._reload_clean_transformer()
+            # The Stage 1 X0Model still wraps the transformer that carried the
+            # IC-LoRA. Denoising Stage 2 through it ran the adapter without its
+            # reference tokens (the sheet / control is not re-appended here) and
+            # kept BOTH transformers resident through the refine — the reload
+            # freed nothing. Stage 2 is the clean model, as the reference's
+            # second ModelLedger is (Phosphene issue #101 diagnosis).
+            x0_model = X0Model(self.dit)
 
         video_tokens_up, _ = self.video_patchifier.patchify(video_upscaled)
 
