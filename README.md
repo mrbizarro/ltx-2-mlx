@@ -1,5 +1,9 @@
 # ltx-2-mlx
 
+> ### Just want to use it? Get [Phosphene](https://phosphene.video/?utm_source=github&utm_medium=ltx-2-mlx)
+> **[Phosphene](https://phosphene.video/?utm_source=github&utm_medium=ltx-2-mlx)** is the free, open-source Mac app built on this port: LTX-2.5 video with sound, one-click install, no terminal.
+> **Will it run on your Mac?** See what each memory size can make and how long a clip takes: [phosphene.video/mac-requirements](https://phosphene.video/mac-requirements/?utm_source=github&utm_medium=ltx-2-mlx)
+
 Pure MLX port of [LTX-2](https://github.com/Lightricks/LTX-2) for Apple Silicon. Three-package monorepo mirroring the reference structure — inference, pipelines, and training — running natively on Metal.
 
 ## Features
