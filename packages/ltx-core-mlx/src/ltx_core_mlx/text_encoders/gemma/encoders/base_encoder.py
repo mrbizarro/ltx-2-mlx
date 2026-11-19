@@ -199,6 +199,14 @@ class GemmaLanguageModel(nn.Module):
             combined_mask = causal_mask[None, None, :, :] + pad_mask  # (B, 1, T, T)
         else:
             combined_mask = causal_mask[None, None, :, :]  # (1, 1, T, T)
+        # H36: a float16 Gemma (M1 Max, 5.0.54/5.0.56) failed every render with
+        # "Mask type must promote to output type float16": SDPA needs the mask
+        # in the hidden-state dtype. Clamp to that dtype's min first so -1e9
+        # stays finite in float16 (a fully padded row must not turn into NaN).
+        if combined_mask.dtype != h.dtype:
+            combined_mask = mx.maximum(
+                combined_mask.astype(mx.float32), mx.finfo(h.dtype).min
+            ).astype(h.dtype)
 
         # Per-layer eval is necessary on <=48 GB Macs to keep each Metal
         # command buffer below the macOS GPU watchdog deadline. The
